@@ -27,7 +27,6 @@ jobs:
 
     - name: Build APK (Debug)
       working-directory: HsApkBinder
-      # এখানে সরাসরি GRADLE_OPTS দিয়ে মেমোরি সেট করা হয়েছে
       env:
         GRADLE_OPTS: "-Xmx2048m -Dfile.encoding=UTF-8"
       run: ./gradlew assembleDebug --no-daemon
