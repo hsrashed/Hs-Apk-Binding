@@ -21,25 +21,42 @@ jobs:
         java-version: '17'
         distribution: 'temurin'
 
-    - name: Setup & Build APK
+    # অ্যান্ড্রয়েড কম্প্যাটিবল Gradle 8.9 সেটআপ
+    - name: Setup Gradle 8.9
+      uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.9'
+
+    - name: Prepare and Build APK
       run: |
-        # প্রজেক্টের আসল ফোল্ডার খুঁজে বের করা
-        BUILD_FILE=$(find . -name "settings.gradle*" -o -name "build.gradle*" | head -n 1)
-        if [ -n "$BUILD_FILE" ]; then
-          TARGET_DIR=$(dirname "$BUILD_FILE")
-          echo "Entering directory: $TARGET_DIR"
-          cd "$TARGET_DIR"
+        # ফোল্ডারে প্রবেশ
+        TARGET_DIR="."
+        if [ -d "HsApkBinder" ]; then
+          TARGET_DIR="HsApkBinder"
+        fi
+        cd "$TARGET_DIR"
+        echo "Building inside: $(pwd)"
+
+        # settings.gradle চেক করা
+        if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
+          if [ -f "../settings.gradle.kts" ]; then
+            cp ../settings.gradle.kts .
+          elif [ -f "../settings.gradle" ]; then
+            cp ../settings.gradle .
+          fi
         fi
 
-        # gradlew না থাকলে স্বয়ংক্রিয়ভাবে তৈরি করা
-        if [ ! -f "gradlew" ]; then
-          echo "gradlew not found. Generating wrapper..."
-          gradle wrapper
+        # libs.versions.toml ঠিক জায়গায় আছে কিনা চেক করা
+        if [ ! -f "gradle/libs.versions.toml" ]; then
+          FOUND_TOML=$(find .. -name "libs.versions.toml" 2>/dev/null | head -n 1)
+          if [ -n "$FOUND_TOML" ]; then
+            mkdir -p gradle
+            cp "$FOUND_TOML" gradle/libs.versions.toml
+          fi
         fi
 
-        # পারমিশন দিয়ে বিল্ড রান করা
-        chmod +x gradlew
-        ./gradlew assembleDebug --stacktrace
+        # Gradle 8.9 দিয়ে সরাসরি বিল্ড চালু
+        gradle assembleDebug --stacktrace
 
     - name: Upload Debug APK
       uses: actions/upload-artifact@v4
