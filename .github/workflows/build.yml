@@ -24,7 +24,7 @@ jobs:
         chmod +x gradlew
 
     - name: Build APK (Debug)
-      working-directory: HsApkBinder2
+      working-directory: HsApkBinder
       run: ./gradlew assembleDebug --no-daemon
 
     - name: Upload APK Artifact
