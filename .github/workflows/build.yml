@@ -2,10 +2,7 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  workflow_dispatch:
+    branches: [ "main", "master" ]
 
 jobs:
   build:
@@ -18,48 +15,20 @@ jobs:
     - name: Set up JDK 17
       uses: actions/setup-java@v4
       with:
-        java-version: '17'
         distribution: 'temurin'
+        java-version: '17'
 
-    # অ্যান্ড্রয়েড কম্প্যাটিবল Gradle 8.9 সেটআপ
-    - name: Setup Gradle 8.9
-      uses: gradle/actions/setup-gradle@v4
-      with:
-        gradle-version: '8.9'
-
-    - name: Prepare and Build APK
+    - name: Grant execute permission for gradlew
       run: |
-        # ফোল্ডারে প্রবেশ
-        TARGET_DIR="."
-        if [ -d "HsApkBinder" ]; then
-          TARGET_DIR="HsApkBinder"
-        fi
-        cd "$TARGET_DIR"
-        echo "Building inside: $(pwd)"
+        cd HsApkBinder2
+        chmod +x gradlew
 
-        # settings.gradle চেক করা
-        if [ ! -f "settings.gradle" ] && [ ! -f "settings.gradle.kts" ]; then
-          if [ -f "../settings.gradle.kts" ]; then
-            cp ../settings.gradle.kts .
-          elif [ -f "../settings.gradle" ]; then
-            cp ../settings.gradle .
-          fi
-        fi
+    - name: Build APK (Debug)
+      working-directory: HsApkBinder2
+      run: ./gradlew assembleDebug --no-daemon
 
-        # libs.versions.toml ঠিক জায়গায় আছে কিনা চেক করা
-        if [ ! -f "gradle/libs.versions.toml" ]; then
-          FOUND_TOML=$(find .. -name "libs.versions.toml" 2>/dev/null | head -n 1)
-          if [ -n "$FOUND_TOML" ]; then
-            mkdir -p gradle
-            cp "$FOUND_TOML" gradle/libs.versions.toml
-          fi
-        fi
-
-        # Gradle 8.9 দিয়ে সরাসরি বিল্ড চালু
-        gradle assembleDebug --stacktrace
-
-    - name: Upload Debug APK
+    - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Hs-Apk-Debug
-        path: '**/build/outputs/apk/debug/*.apk'
+        name: app-debug
+        path: HsApkBinder2/app/build/outputs/apk/debug/app-debug.apk
