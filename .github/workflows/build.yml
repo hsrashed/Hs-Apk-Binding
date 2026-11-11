@@ -18,9 +18,10 @@ jobs:
         distribution: 'temurin'
         java-version: '17'
 
-    - name: Locate and Build APK
+    - name: Generate Gradle Wrapper and Build APK
       run: |
         cd HsApkBinder
+        gradle wrapper
         chmod +x gradlew
         ./gradlew assembleDebug --no-daemon
 
