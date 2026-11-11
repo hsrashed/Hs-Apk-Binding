@@ -19,11 +19,13 @@ jobs:
         java-version: '17'
 
     - name: Grant execute permission for gradlew
-      run: chmod +x HsApkBinder/gradlew
+      run: |
+        cd HsApkBinder
+        chmod +x gradlew
 
     - name: Build APK (Debug)
       working-directory: HsApkBinder
-      run: ./gradlew assembleDebug
+      run: ./gradlew assembleDebug --no-daemon
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
