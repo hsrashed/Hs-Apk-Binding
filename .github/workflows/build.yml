@@ -25,7 +25,9 @@ jobs:
 
     - name: Build APK (Debug)
       working-directory: HsApkBinder
-      run: ./gradlew assembleDebug --no-daemon
+      run: ./gradlew assembleDebug --no-daemon -Porg.gradle.jvmargs="-Xmx2048m -Dfile.encoding=UTF-8"
+      env:
+        ORG_GRADLE_PROJECT_jvmargs: "-Xmx2048m -Dfile.encoding=UTF-8"
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
