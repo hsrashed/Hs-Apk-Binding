@@ -1,0 +1,47 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Locate project folder
+        run: |
+          FILE=$(find . -name settings.gradle.kts -not -path "*/build/*" | head -1)
+          DIR=$(dirname "$FILE")
+          echo "PROJECT_DIR=$DIR" >> $GITHUB_ENV
+          echo "Found project at: $DIR"
+
+      - name: Generate payload keystore
+        run: |
+          mkdir -p "$PROJECT_DIR/app/src/main/assets"
+          keytool -genkeypair -v -keystore "$PROJECT_DIR/app/src/main/assets/payload.keystore" \
+            -storetype PKCS12 -alias hs -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass hsapkbinder -keypass hsapkbinder -dname "CN=Hs Apk Binder"
+
+      - name: Build APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HsApkBinder-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
