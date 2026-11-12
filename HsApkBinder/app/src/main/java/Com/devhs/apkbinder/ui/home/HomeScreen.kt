@@ -2,6 +2,7 @@ package Com.devhs.apkbinder.ui.home
 
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -47,13 +48,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.core.graphics.drawable.toBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.painter.BitmapPainter
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.graphics.drawable.toBitmap
 import androidx.documentfile.provider.DocumentFile
 import Com.devhs.apkbinder.binder.BinderEngine
 import Com.devhs.apkbinder.data.Feature
@@ -65,6 +66,7 @@ import Com.devhs.apkbinder.ui.components.FeatureCheck
 import Com.devhs.apkbinder.ui.components.GlowCard
 import Com.devhs.apkbinder.ui.components.NeonGradientButton
 import Com.devhs.apkbinder.ui.components.TerminalConsole
+import Com.devhs.apkbinder.ui.theme.BgDeep
 import Com.devhs.apkbinder.ui.theme.BgElevated
 import Com.devhs.apkbinder.ui.theme.BgSurface
 import Com.devhs.apkbinder.ui.theme.NeonBlue
@@ -172,7 +174,7 @@ fun HomeScreen() {
                 SmallFloatingActionButton(
                     onClick = { pickApk.launch(arrayOf("application/vnd.android.package-archive")) },
                     containerColor = NeonBlue,
-                    contentColor = Com.devhs.apkbinder.ui.theme.BgDeep
+                    contentColor = BgDeep
                 ) { Icon(Icons.Default.Add, null) }
             }
         }
@@ -266,12 +268,26 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
     val ctx = LocalContext.current
     var apps by remember { mutableStateOf<List<ApplicationInfo>>(emptyList()) }
     var query by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(true) }
+    var error by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
-        apps = withContext(Dispatchers.IO) {
-            ctx.packageManager.getInstalledApplications(0)
-                .filter { it.sourceDir != null && it.packageName != ctx.packageName }
-                .sortedBy { it.loadLabel(ctx.packageManager).toString().lowercase() }
+        try {
+            val loaded = withContext(Dispatchers.IO) {
+                val pm = ctx.packageManager
+                val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                pm.queryIntentActivities(intent, 0)
+                    .map { it.activityInfo.applicationInfo }
+                    .filter { it.packageName != ctx.packageName }
+                    .distinctBy { it.packageName }
+                    .sortedBy { it.loadLabel(pm).toString().lowercase() }
+            }
+            apps = loaded
+            if (loaded.isEmpty()) error = "No apps found. Tap Close and reopen."
+        } catch (t: Throwable) {
+            error = t.message ?: "Failed to load apps"
+        } finally {
+            loading = false
         }
     }
 
@@ -293,30 +309,48 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(Modifier.height(10.dp))
-                LazyColumn(Modifier.heightIn(max = 380.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    items(filtered) { info ->
-                        Row(
-                            Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .padding(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                BitmapPainter(
-                                    android.graphics.Bitmap.createScaledBitmap(
-                                        info.loadIcon(ctx.packageManager).toBitmap(), 64, 64, true
-                                    ).asImageBitmap()
-                                ),
-                                null,
-                                modifier = Modifier.size(32.dp)
-                            )
-                            Spacer(Modifier.width(10.dp))
-                            Column(Modifier.weight(1f)) {
-                                Text(info.loadLabel(ctx.packageManager).toString(), color = TextPrimary, fontSize = 14.sp)
-                                Text(info.packageName, color = TextMuted, fontSize = 10.sp, maxLines = 1)
+
+                if (loading) {
+                    Text("Loading apps...", color = TextMuted, fontSize = 12.sp)
+                } else if (filtered.isEmpty()) {
+                    Text(
+                        if (error.isNotBlank()) error else "No match",
+                        color = TextMuted,
+                        fontSize = 12.sp
+                    )
+                } else {
+                    LazyColumn(
+                        Modifier.heightIn(max = 380.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        items(filtered) { info ->
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    BitmapPainter(
+                                        android.graphics.Bitmap.createScaledBitmap(
+                                            info.loadIcon(ctx.packageManager).toBitmap(), 64, 64, true
+                                        ).asImageBitmap()
+                                    ),
+                                    null,
+                                    modifier = Modifier.size(32.dp)
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        info.loadLabel(ctx.packageManager).toString(),
+                                        color = TextPrimary,
+                                        fontSize = 14.sp
+                                    )
+                                    Text(info.packageName, color = TextMuted, fontSize = 10.sp, maxLines = 1)
+                                }
+                                TextButton(onClick = { onPick(info) }) { Text("Pick", color = NeonTeal) }
                             }
-                            TextButton(onClick = { onPick(info) }) { Text("Pick", color = NeonTeal) }
                         }
                     }
                 }
