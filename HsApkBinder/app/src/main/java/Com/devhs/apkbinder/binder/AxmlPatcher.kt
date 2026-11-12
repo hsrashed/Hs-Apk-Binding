@@ -28,6 +28,106 @@ object AxmlPatcher {
     class Attr(val name: String, val resId: Int, val value: Value)
     class Element(val name: String, val attrs: List<Attr>)
 
+    private class Pool(
+        val start: Int,
+        val size: Int,
+        val headerSize: Int,
+        val count: Int,
+        val styleCount: Int,
+        val flags: Int,
+        val stringsStart: Int,
+        val stylesStart: Int
+    )
+
+    private fun readPool(xml: ByteArray, start: Int): Pool = Pool(
+        start = start,
+        size = i32(xml, start + 4),
+        headerSize = u16(xml, start + 2),
+        count = i32(xml, start + 8),
+        styleCount = i32(xml, start + 12),
+        flags = i32(xml, start + 16),
+        stringsStart = i32(xml, start + 20),
+        stylesStart = i32(xml, start + 24)
+    )
+
+    private fun stringOffset(xml: ByteArray, pool: Pool, index: Int): Int =
+        pool.start + pool.stringsStart + i32(xml, pool.start + pool.headerSize + index * 4)
+
+    private fun decodeAt(xml: ByteArray, off: Int, utf8: Boolean): String? = try {
+        if (off < 0 || off >= xml.size) null
+        else if (utf8) {
+            val a = readVarint(xml, off)
+            if (a == null) null else {
+                val b = readVarint(xml, a.second)
+                if (b == null || b.second + b.first > xml.size) null
+                else String(xml, b.second, b.first, Charsets.UTF_8)
+            }
+        } else {
+            val a = readVarint(xml, off)
+            if (a == null || a.second + a.first * 2 > xml.size) null
+            else {
+                val sb = StringBuilder(a.first)
+                for (i in 0 until a.first) sb.append(u16(xml, a.second + i * 2).toChar())
+                sb.toString()
+            }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    private fun matches(xml: ByteArray, pool: Pool, index: Int, target: String): Boolean {
+        if (index < 0 || index >= pool.count) return false
+        val off = stringOffset(xml, pool, index)
+        val declared = (pool.flags and FLAG_UTF8) != 0
+        if (decodeAt(xml, off, declared) == target) return true
+        return decodeAt(xml, off, !declared) == target
+    }
+
+    private fun indexOf(xml: ByteArray, pool: Pool, target: String): Int {
+        for (i in 0 until pool.count) if (matches(xml, pool, i, target)) return i
+        return -1
+    }
+
+    private fun findElement(xml: ByteArray, name: String): Int {
+        val pool = readPool(xml, 8)
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (size < 8 || pos + size > xml.size) break
+            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), name)) return pos
+            pos += size
+        }
+        return -1
+    }
+
+    fun readApplicationName(xml: ByteArray): String? = try {
+        val pos = findElement(xml, "application")
+        if (pos < 0) null else {
+            val pool = readPool(xml, 8)
+            val count = u16(xml, pos + 28)
+            var found: String? = null
+            for (i in 0 until count) {
+                val a = pos + 36 + i * 20
+                if (!matches(xml, pool, i32(xml, a + 4), "name")) continue
+                val raw = i32(xml, a + 8)
+                val data = i32(xml, a + 16)
+                val idx = if (raw >= 0) raw else data
+                if (idx < 0 || idx >= pool.count) continue
+                val off = stringOffset(xml, pool, idx)
+                val declared = (pool.flags and FLAG_UTF8) != 0
+                val s = decodeAt(xml, off, declared) ?: decodeAt(xml, off, !declared)
+                if (!s.isNullOrBlank()) {
+                    found = s
+                    break
+                }
+            }
+            found
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
     fun patch(
         xml: ByteArray,
         newAppClass: String,
@@ -35,116 +135,74 @@ object AxmlPatcher {
         serviceClass: String,
         permissions: List<String>
     ): ByteArray {
-        val extra = mutableListOf<String>()
+        val added = mutableListOf<String>()
         val attrIds = LinkedHashMap<String, Int>()
 
         fun addAttr(name: String, id: Int) {
-            if (!extra.contains(name)) {
-                extra.add(name)
+            if (!added.contains(name)) {
+                added.add(name)
                 attrIds[name] = id
             }
         }
         addAttr("name", ATTR_NAME)
         addAttr("theme", ATTR_THEME)
         addAttr("foregroundServiceType", ATTR_FG_TYPE)
-        listOf("activity", "service", "uses-permission").forEach { if (!extra.contains(it)) extra.add(it) }
-        extra.add(newAppClass)
-        extra.add(activityClass)
-        extra.add(serviceClass)
-        permissions.forEach { extra.add(it) }
+        listOf("activity", "service", "uses-permission").forEach { if (!added.contains(it)) added.add(it) }
+        added.add(newAppClass)
+        added.add(activityClass)
+        added.add(serviceClass)
+        permissions.forEach { if (!added.contains(it)) added.add(it) }
 
-        var out = rebuildStringPool(xml, extra, attrIds)
+        val poolBefore = readPool(xml, 8)
+        var out = appendStrings(xml, poolBefore, added, attrIds)
         out = setApplicationName(out, newAppClass)
 
         out = insertChildren(
             out,
             listOf(
-                Element("activity", listOf(
-                    Attr("name", ATTR_NAME, Value.Str(activityClass)),
-                    Attr("theme", ATTR_THEME, Value.Ref(STYLE_TRANSLUCENT))
-                )),
-                Element("service", listOf(
-                    Attr("name", ATTR_NAME, Value.Str(serviceClass)),
-                    Attr("foregroundServiceType", ATTR_FG_TYPE, Value.Dec(1))
-                ))
+                Element(
+                    "activity",
+                    listOf(
+                        Attr("name", ATTR_NAME, Value.Str(activityClass)),
+                        Attr("theme", ATTR_THEME, Value.Ref(STYLE_TRANSLUCENT))
+                    )
+                ),
+                Element(
+                    "service",
+                    listOf(
+                        Attr("name", ATTR_NAME, Value.Str(serviceClass)),
+                        Attr("foregroundServiceType", ATTR_FG_TYPE, Value.Dec(1))
+                    )
+                )
             )
         )
 
-        out = insertBeforeApplication(
+        return insertBeforeApplication(
             out,
             permissions.map { Element("uses-permission", listOf(Attr("name", ATTR_NAME, Value.Str(it)))) }
         )
-        return out
     }
 
-    private class PoolInfo(
-        val start: Int,
-        val size: Int,
-        val strings: List<String>,
-        val flags: Int,
-        val styleData: ByteArray,
-        val styleOffsets: IntArray
-    )
-
-    private fun readPool(b: ByteArray, start: Int): PoolInfo {
-        val headerSize = u16(b, start + 2)
-        val size = i32(b, start + 4)
-        val count = i32(b, start + 8)
-        val styleCount = i32(b, start + 12)
-        val flags = i32(b, start + 16)
-        val stringsStart = i32(b, start + 20)
-        val stylesStart = i32(b, start + 24)
-        val utf8 = (flags and FLAG_UTF8) != 0
-        val dataStart = start + stringsStart
-
-        val strings = ArrayList<String>(count)
-        for (i in 0 until count) {
-            val off = i32(b, start + headerSize + i * 4)
-            strings.add(if (utf8) decodeUtf8(b, dataStart + off) else decodeUtf16(b, dataStart + off))
-        }
-        val styleOffsets = IntArray(styleCount) { i32(b, start + headerSize + count * 4 + it * 4) }
-        val styleData = if (styleCount > 0 && stylesStart > 0) b.copyOfRange(start + stylesStart, start + size) else ByteArray(0)
-        return PoolInfo(start, size, strings, flags, styleData, styleOffsets)
-    }
-
-    private fun decodeUtf8(b: ByteArray, off: Int): String {
-        var p = off
-        val a = readVarint(b, p); p = a.second
-        val len = readVarint(b, p); p = len.second
-        return String(b, p, len.first, Charsets.UTF_8)
-    }
-
-    private fun decodeUtf16(b: ByteArray, off: Int): String {
-        val len = readVarint(b, off)
-        val sb = StringBuilder(len.first)
-        for (i in 0 until len.first) sb.append(u16(b, len.second + i * 2).toChar())
-        return sb.toString()
-    }
-
-    private fun readVarint(b: ByteArray, off: Int): Pair<Int, Int> {
-        val first = b[off].toInt() and 0xFF
-        return if (first and 0x80 != 0) {
-            (((first and 0x7F) shl 8) or (b[off + 1].toInt() and 0xFF)) to off + 2
-        } else first to off + 1
-    }
-
-    private fun writeVarint(out: ByteArrayOutputStream, v: Int) {
-        if (v > 0x7F) {
-            out.write(((v shr 8) or 0x80) and 0xFF)
-            out.write(v and 0xFF)
-        } else out.write(v)
-    }
-
-    private fun rebuildStringPool(xml: ByteArray, extra: List<String>, attrIds: Map<String, Int>): ByteArray {
-        val pool = readPool(xml, 8)
-        val all = pool.strings + extra
+    private fun appendStrings(
+        xml: ByteArray,
+        pool: Pool,
+        added: List<String>,
+        attrIds: Map<String, Int>
+    ): ByteArray {
         val utf8 = (pool.flags and FLAG_UTF8) != 0
+        val dataStart = pool.start + pool.stringsStart
+        val dataEnd = if (pool.styleCount > 0 && pool.stylesStart > 0) pool.start + pool.stylesStart
+        else pool.start + pool.size
+        val oldData = xml.copyOfRange(dataStart, minOf(dataEnd, xml.size))
+        val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
+            xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
 
         val data = ByteArrayOutputStream()
-        val offsets = IntArray(all.size)
-        for ((i, s) in all.withIndex()) {
+        data.write(oldData)
+        val newOffsets = IntArray(added.size)
+        for ((i, s) in added.withIndex()) {
             while (data.size() % 4 != 0) data.write(0)
-            offsets[i] = data.size()
+            newOffsets[i] = data.size()
             if (utf8) {
                 writeVarint(data, s.length)
                 val bytes = s.toByteArray(Charsets.UTF_8)
@@ -157,49 +215,55 @@ object AxmlPatcher {
                     data.write(ch.code and 0xFF)
                     data.write((ch.code shr 8) and 0xFF)
                 }
-                data.write(0); data.write(0)
+                data.write(0)
+                data.write(0)
             }
         }
         while (data.size() % 4 != 0) data.write(0)
 
-        val headerSize = 28
-        val styleCount = pool.styleOffsets.size
-        val stringsStart = headerSize + all.size * 4 + styleCount * 4
-        val stylesStart = if (styleCount > 0) stringsStart + data.size() else 0
-        val chunkSize = stringsStart + data.size() + pool.styleData.size
+        val newCount = pool.count + added.size
+        val newData = data.toByteArray()
+        val stringsStart = pool.headerSize + newCount * 4 + pool.styleCount * 4
+        val stylesStart = if (pool.styleCount > 0) stringsStart + newData.size else 0
+        val chunkSize = stringsStart + newData.size + styleData.size
 
-        val poolOut = ByteArrayOutputStream()
-        poolOut.writeU16(CHUNK_STRING_POOL)
-        poolOut.writeU16(28)
-        poolOut.writeI32(chunkSize)
-        poolOut.writeI32(all.size)
-        poolOut.writeI32(styleCount)
-        poolOut.writeI32(pool.flags)
-        poolOut.writeI32(stringsStart)
-        poolOut.writeI32(stylesStart)
-        offsets.forEach { poolOut.writeI32(it) }
-        pool.styleOffsets.forEach { poolOut.writeI32(it) }
-        poolOut.write(data.toByteArray())
-        poolOut.write(pool.styleData)
+        val out = ByteArrayOutputStream()
+        out.write(xml, 0, pool.start)
+        out.writeU16(CHUNK_STRING_POOL)
+        out.writeU16(pool.headerSize)
+        out.writeI32(chunkSize)
+        out.writeI32(newCount)
+        out.writeI32(pool.styleCount)
+        out.writeI32(pool.flags)
+        out.writeI32(stringsStart)
+        out.writeI32(stylesStart)
+        for (i in 0 until pool.count) out.writeI32(i32(xml, pool.start + pool.headerSize + i * 4))
+        newOffsets.forEach { out.writeI32(it) }
+        for (i in 0 until pool.styleCount) {
+            out.writeI32(i32(xml, pool.start + pool.headerSize + pool.count * 4 + i * 4))
+        }
+        out.write(newData)
+        out.write(styleData)
+        out.write(xml, pool.start + pool.size, xml.size - pool.start - pool.size)
 
-        val result = ByteArrayOutputStream()
-        result.write(xml, 0, 8)
-        result.write(poolOut.toByteArray())
-        result.write(xml, 8 + pool.size, xml.size - 8 - pool.size)
-        val merged = result.toByteArray()
-        putI32(merged, 4, merged.size)
-        return extendResourceMap(merged, all.size, attrIds)
+        val result = out.toByteArray()
+        putI32(result, 4, result.size)
+        return extendResourceMap(result, newCount, attrIds)
     }
 
     private fun extendResourceMap(xml: ByteArray, needed: Int, ids: Map<String, Int>): ByteArray {
         val pool = readPool(xml, 8)
-        val pos = 8 + pool.size
-        if (pos + 8 > xml.size) return xml
-        if (u16(xml, pos) != CHUNK_RESOURCE_MAP) return xml
+        val pos = pool.start + pool.size
+        if (pos + 8 > xml.size || u16(xml, pos) != CHUNK_RESOURCE_MAP) return xml
 
         val mapSize = i32(xml, pos + 4)
         val entries = (mapSize - 8) / 4
         val grow = (needed - entries).coerceAtLeast(0)
+
+        val resolved = ids.mapNotNull { (name, id) ->
+            val idx = indexOf(xml, pool, name)
+            if (idx >= 0) idx to id else null
+        }
 
         val out = ByteArrayOutputStream()
         out.write(xml, 0, pos + mapSize)
@@ -209,28 +273,8 @@ object AxmlPatcher {
 
         putI32(result, pos + 4, mapSize + grow * 4)
         putI32(result, 4, result.size)
-
-        ids.forEach { (name, id) ->
-            val idx = pool.strings.indexOf(name)
-            if (idx >= 0) putI32(result, pos + 8 + idx * 4, id)
-        }
+        resolved.forEach { (idx, id) -> putI32(result, pos + 8 + idx * 4, id) }
         return result
-    }
-
-    private fun findElement(xml: ByteArray, name: String): Int {
-        val pool = readPool(xml, 8)
-        var pos = 8
-        while (pos + 8 <= xml.size) {
-            val type = u16(xml, pos)
-            val size = i32(xml, pos + 4)
-            if (size <= 0) break
-            if (type == CHUNK_START_ELEMENT) {
-                val nameIdx = i32(xml, pos + 20)
-                if (nameIdx in pool.strings.indices && pool.strings[nameIdx] == name) return pos
-            }
-            pos += size
-        }
-        return -1
     }
 
     private fun setApplicationName(xml: ByteArray, cls: String): ByteArray {
@@ -238,15 +282,15 @@ object AxmlPatcher {
         require(pos >= 0) { "application element not found" }
 
         val pool = readPool(xml, 8)
-        val nameIdx = pool.strings.indexOf("name")
-        val nsIdx = pool.strings.indexOf(ANDROID_NS)
-        val clsIdx = pool.strings.indexOf(cls)
+        val nameIdx = indexOf(xml, pool, "name")
+        val nsIdx = indexOf(xml, pool, ANDROID_NS)
+        val clsIdx = indexOf(xml, pool, cls)
         val count = u16(xml, pos + 28)
         val base = pos + 36
 
         for (i in 0 until count) {
             val a = base + i * 20
-            if (i32(xml, a) == nsIdx && i32(xml, a + 4) == nameIdx) {
+            if (matches(xml, pool, i32(xml, a + 4), "name")) {
                 putI32(xml, a + 8, clsIdx)
                 putI32(xml, a + 12, 8)
                 putI32(xml, a + 16, 0)
@@ -273,11 +317,11 @@ object AxmlPatcher {
         val insertPos = pos + 36 + count * 20
 
         val pool = readPool(xml, 8)
-        val nsIdx = pool.strings.indexOf(ANDROID_NS)
+        val nsIdx = indexOf(xml, pool, ANDROID_NS)
 
         val buf = ByteArrayOutputStream()
         elements.forEach { el ->
-            val nameIdx = pool.strings.indexOf(el.name)
+            val nameIdx = indexOf(xml, pool, el.name)
             buf.writeU16(CHUNK_START_ELEMENT)
             buf.writeU16(16)
             buf.writeI32(36 + el.attrs.size * 20)
@@ -293,20 +337,29 @@ object AxmlPatcher {
             buf.writeU16(0)
             el.attrs.forEach { at ->
                 buf.writeI32(nsIdx)
-                buf.writeI32(pool.strings.indexOf(at.name))
+                buf.writeI32(indexOf(xml, pool, at.name))
                 when (val v = at.value) {
                     is Value.Str -> {
-                        val idx = pool.strings.indexOf(v.v)
-                        buf.writeI32(idx); buf.writeI32(8)
-                        buf.writeI32(0); buf.writeU16(TYPE_STRING); buf.writeI32(idx)
+                        val idx = indexOf(xml, pool, v.v)
+                        buf.writeI32(idx)
+                        buf.writeI32(8)
+                        buf.writeI32(0)
+                        buf.writeU16(TYPE_STRING)
+                        buf.writeI32(idx)
                     }
                     is Value.Ref -> {
-                        buf.writeI32(-1); buf.writeI32(8)
-                        buf.writeI32(0); buf.writeU16(TYPE_REFERENCE); buf.writeI32(v.v)
+                        buf.writeI32(-1)
+                        buf.writeI32(8)
+                        buf.writeI32(0)
+                        buf.writeU16(TYPE_REFERENCE)
+                        buf.writeI32(v.v)
                     }
                     is Value.Dec -> {
-                        buf.writeI32(-1); buf.writeI32(8)
-                        buf.writeI32(0); buf.writeU16(TYPE_INT_DEC); buf.writeI32(v.v)
+                        buf.writeI32(-1)
+                        buf.writeI32(8)
+                        buf.writeI32(0)
+                        buf.writeU16(TYPE_INT_DEC)
+                        buf.writeI32(v.v)
                     }
                 }
             }
@@ -329,14 +382,15 @@ object AxmlPatcher {
     private fun insertBeforeApplication(xml: ByteArray, elements: List<Element>): ByteArray {
         val pos = findElement(xml, "application")
         if (pos < 0) return xml
+
         val pool = readPool(xml, 8)
-        val elemIdx = pool.strings.indexOf("uses-permission")
-        val nameIdx = pool.strings.indexOf("name")
-        val nsIdx = pool.strings.indexOf(ANDROID_NS)
+        val elemIdx = indexOf(xml, pool, "uses-permission")
+        val nameIdx = indexOf(xml, pool, "name")
+        val nsIdx = indexOf(xml, pool, ANDROID_NS)
 
         val buf = ByteArrayOutputStream()
         elements.forEach { el ->
-            val valueIdx = pool.strings.indexOf((el.attrs.first().value as Value.Str).v)
+            val valueIdx = indexOf(xml, pool, (el.attrs.first().value as Value.Str).v)
             buf.writeU16(CHUNK_START_ELEMENT)
             buf.writeU16(16)
             buf.writeI32(56)
@@ -376,6 +430,22 @@ object AxmlPatcher {
         val result = out.toByteArray()
         putI32(result, 4, result.size)
         return result
+    }
+
+    private fun readVarint(b: ByteArray, off: Int): Pair<Int, Int>? {
+        if (off < 0 || off >= b.size) return null
+        val first = b[off].toInt() and 0xFF
+        return if (first and 0x80 != 0) {
+            if (off + 1 >= b.size) null
+            else (((first and 0x7F) shl 8) or (b[off + 1].toInt() and 0xFF)) to off + 2
+        } else first to off + 1
+    }
+
+    private fun writeVarint(out: ByteArrayOutputStream, v: Int) {
+        if (v > 0x7F) {
+            out.write(((v shr 8) or 0x80) and 0xFF)
+            out.write(v and 0xFF)
+        } else out.write(v)
     }
 
     private fun u16(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
