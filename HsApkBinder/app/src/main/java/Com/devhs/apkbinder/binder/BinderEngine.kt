@@ -63,6 +63,7 @@ class BinderEngine(private val ctx: Context) {
 
         val originalApp = AxmlPatcher.readApplicationName(manifest)
         onLog(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
+        onLog(LogLevel.INFO, "Manifest size: " + manifest.size + " bytes")
 
         onLog(LogLevel.INFO, "Patching AndroidManifest.xml...")
         val patched = try {
@@ -77,7 +78,8 @@ class BinderEngine(private val ctx: Context) {
             srcZip.close()
             throw IllegalStateException(
                 "Manifest patch failed: " + (t.message ?: "unknown") +
-                    ". This APK may use an unusual manifest format."
+                    " (manifest=" + manifest.size + " bytes). " +
+                    "If this is a split APK, use a single-APK build instead."
             )
         }
         onLog(LogLevel.SUCCESS, "Manifest patched")
