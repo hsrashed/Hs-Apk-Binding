@@ -1,7 +1,6 @@
 package Com.devhs.apkbinder.payload
 
 import android.Manifest
-import android.app.Activity
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
@@ -12,9 +11,10 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
 
-class PermissionGateActivity : Activity(), PayloadServiceHost {
+class PermissionGateActivity : ComponentActivity(), PayloadServiceHost {
 
     private val launcher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
