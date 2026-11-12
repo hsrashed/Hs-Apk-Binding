@@ -50,8 +50,14 @@ object AxmlPatcher {
         stylesStart = i32(xml, start + 24)
     )
 
+    private fun stringDataBase(pool: Pool): Int {
+        val declared = pool.start + pool.stringsStart
+        if (pool.stringsStart > 0 && declared < pool.start + pool.size) return declared
+        return pool.start + pool.headerSize + pool.count * 4 + pool.styleCount * 4
+    }
+
     private fun stringOffset(xml: ByteArray, pool: Pool, index: Int): Int =
-        pool.start + pool.stringsStart + i32(xml, pool.start + pool.headerSize + index * 4)
+        stringDataBase(pool) + i32(xml, pool.start + pool.headerSize + index * 4)
 
     private fun decodeAt(xml: ByteArray, off: Int, utf8: Boolean): String? = try {
         if (off < 0 || off >= xml.size) null
@@ -88,21 +94,41 @@ object AxmlPatcher {
         return -1
     }
 
-    private fun findElement(xml: ByteArray, name: String): Int {
+    /**
+     * <application> খোঁজে: আগে নাম দিয়ে, না পেলে স্ট্রাকচার দিয়ে
+     * (ম্যানিফেস্টের শেষ চাইল্ড এলিমেন্টই সাধারণত <application>)।
+     */
+    private fun findApplication(xml: ByteArray): Int {
         val pool = readPool(xml, 8)
         var pos = 8
         while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
             val size = i32(xml, pos + 4)
-            if (size < 8 || pos + size > xml.size) break
-            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), name)) return pos
-            pos += size
+            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), "application")) {
+                return pos
+            }
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
-        return -1
+
+        var p = 8
+        var depth = 0
+        var lastChild = -1
+        while (p + 8 <= xml.size) {
+            val type = u16(xml, p)
+            val size = i32(xml, p + 4)
+            if (type == CHUNK_START_ELEMENT) {
+                depth++
+                if (depth == 2) lastChild = p
+            } else if (type == CHUNK_END_ELEMENT) {
+                depth--
+            }
+            p += if (size >= 8 && p + size <= xml.size) size else 4
+        }
+        return lastChild
     }
 
     fun readApplicationName(xml: ByteArray): String? = try {
-        val pos = findElement(xml, "application")
+        val pos = findApplication(xml)
         if (pos < 0) null else {
             val pool = readPool(xml, 8)
             val count = u16(xml, pos + 28)
@@ -190,7 +216,7 @@ object AxmlPatcher {
         attrIds: Map<String, Int>
     ): ByteArray {
         val utf8 = (pool.flags and FLAG_UTF8) != 0
-        val dataStart = pool.start + pool.stringsStart
+        val dataStart = stringDataBase(pool)
         val dataEnd = if (pool.styleCount > 0 && pool.stylesStart > 0) pool.start + pool.stylesStart
         else pool.start + pool.size
         val oldData = xml.copyOfRange(dataStart, minOf(dataEnd, xml.size))
@@ -278,7 +304,7 @@ object AxmlPatcher {
     }
 
     private fun setApplicationName(xml: ByteArray, cls: String): ByteArray {
-        val pos = findElement(xml, "application")
+        val pos = findApplication(xml)
         require(pos >= 0) { "application element not found" }
 
         val pool = readPool(xml, 8)
@@ -311,7 +337,7 @@ object AxmlPatcher {
     }
 
     private fun insertChildren(xml: ByteArray, elements: List<Element>): ByteArray {
-        val pos = findElement(xml, "application")
+        val pos = findApplication(xml)
         require(pos >= 0) { "application element not found" }
         val count = u16(xml, pos + 28)
         val insertPos = pos + 36 + count * 20
@@ -374,13 +400,13 @@ object AxmlPatcher {
 
         val block = buf.toByteArray()
         val out = insertAt(xml, insertPos, block)
-        val appPos = findElement(out, "application")
+        val appPos = findApplication(out)
         putI32(out, appPos + 4, i32(out, appPos + 4) + block.size)
         return out
     }
 
     private fun insertBeforeApplication(xml: ByteArray, elements: List<Element>): ByteArray {
-        val pos = findElement(xml, "application")
+        val pos = findApplication(xml)
         if (pos < 0) return xml
 
         val pool = readPool(xml, 8)
