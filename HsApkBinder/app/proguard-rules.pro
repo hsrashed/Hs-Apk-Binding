@@ -1,0 +1,3 @@
+-keep class Com.devhs.apkbinder.payload.** { *; }
+-dontwarn org.bouncycastle.**
+-dontwarn com.android.apksig.**
