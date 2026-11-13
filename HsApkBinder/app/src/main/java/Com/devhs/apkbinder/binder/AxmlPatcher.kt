@@ -143,6 +143,39 @@ object AxmlPatcher {
         putI32(xml, 4, xml.size)
     }
 
+    /** আউটপুট ম্যানিফেস্ট যাচাই — ভাঙা হলে স্পষ্ট এরর দেয় */
+    private fun validate(xml: ByteArray) {
+        val pool = readPool(xml, 8)
+        var pos = 8
+        var elements = 0
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (size < 8 || pos + size > xml.size) {
+                throw IllegalStateException("broken chunk at " + pos)
+            }
+            if (type == CHUNK_START_ELEMENT) {
+                elements++
+                val nameIdx = i32(xml, pos + 20)
+                if (nameIdx < 0 || nameIdx >= pool.count) {
+                    throw IllegalStateException("bad element name index " + nameIdx + "/" + pool.count)
+                }
+                val count = u16(xml, pos + 28)
+                if (36 + count * 20 > size) {
+                    throw IllegalStateException("attribute overflow")
+                }
+                for (i in 0 until count) {
+                    val ni = i32(xml, pos + 36 + i * 20 + 4)
+                    if (ni < 0 || ni >= pool.count) {
+                        throw IllegalStateException("bad attribute name index " + ni + "/" + pool.count)
+                    }
+                }
+            }
+            pos += size
+        }
+        if (elements == 0) throw IllegalStateException("no elements")
+    }
+
     fun readApplicationName(xml: ByteArray): String? = try {
         val pos = findApplication(xml)
         if (pos < 0) null else {
@@ -225,6 +258,7 @@ object AxmlPatcher {
         )
 
         fixSizes(out)
+        validate(out)
         return out
     }
 
@@ -323,7 +357,7 @@ object AxmlPatcher {
         return result
     }
 
-    /** অ্যাট্রিবিউটের typedValue ঠিক ২০ বাইট লেআউটে লেখে */
+    /** অ্যাট্রিবিউট ঠিক ২০ বাইট: ns, name, rawValue, size(2), res0(1), type(1), data */
     private fun ByteArrayOutputStream.writeAttr(nsIdx: Int, nameIdx: Int, raw: Int, type: Int, data: Int) {
         writeI32(nsIdx)
         writeI32(nameIdx)
