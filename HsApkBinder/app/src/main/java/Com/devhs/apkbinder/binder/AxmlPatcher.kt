@@ -20,7 +20,7 @@ object AxmlPatcher {
     const val STYLE_TRANSLUCENT = 0x0103000b
 
     sealed class Value {
-        data class Str(val v: String) : Value()
+        data class Str(val slot: Int) : Value()
         data class Ref(val v: Int) : Value()
         data class Dec(val v: Int) : Value()
     }
@@ -244,14 +244,14 @@ object AxmlPatcher {
                 Element(
                     slot(4),
                     listOf(
-                        Attr(slot(0), Value.Str(activityClass)),
+                        Attr(slot(0), Value.Str(slot(8))),
                         Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
                     )
                 ),
                 Element(
                     slot(5),
                     listOf(
-                        Attr(slot(0), Value.Str(serviceClass)),
+                        Attr(slot(0), Value.Str(slot(9))),
                         Attr(slot(2), Value.Dec(1))
                     )
                 )
@@ -437,7 +437,7 @@ object AxmlPatcher {
             buf.writeU16(0)
             el.attrs.forEach { at ->
                 when (val v = at.value) {
-                    is Value.Str -> buf.writeAttr(nsSlot, at.nameSlot, v.v, TYPE_STRING, v.v)
+                    is Value.Str -> buf.writeAttr(nsSlot, at.nameSlot, v.slot, TYPE_STRING, v.slot)
                     is Value.Ref -> buf.writeAttr(-1, at.nameSlot, -1, TYPE_REFERENCE, v.v)
                     is Value.Dec -> buf.writeAttr(-1, at.nameSlot, -1, TYPE_INT_DEC, v.v)
                 }
