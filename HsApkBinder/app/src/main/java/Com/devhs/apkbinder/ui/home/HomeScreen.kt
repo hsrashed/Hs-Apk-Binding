@@ -25,8 +25,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Android
-import androidx.compose.material.icons.filled.ContentPaste
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
@@ -106,7 +106,7 @@ fun HomeScreen() {
     val pickApk = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             apkUri = uri
-            apkLabel = uri.lastPathSegment ?: "selected.apk"
+            apkLabel = uri.lastPathSegment ?: "app.apk"
             log(LogLevel.SUCCESS, "APK selected")
         }
     }
@@ -134,6 +134,7 @@ fun HomeScreen() {
                 BinderEngine(ctx).bind(
                     source = uri,
                     activity = activityInput.trim(),
+                    label = apkLabel,
                     features = selected.toSet(),
                     config = PayloadConfig(token, chatId, selected.map { it.key }, null),
                     outDir = dirDoc,
@@ -160,7 +161,7 @@ fun HomeScreen() {
 
         GlowCard(onClick = { if (!busy) showApps = true }) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Android, null, tint = NeonTeal)
+                Icon(Icons.Default.CheckCircle, null, tint = NeonTeal)
                 Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f)) {
                     Text("Select Apk", color = TextPrimary, fontWeight = FontWeight.SemiBold, fontSize = 16.sp)
@@ -210,7 +211,7 @@ fun HomeScreen() {
                     containerColor = BgElevated,
                     contentColor = NeonTeal
                 )
-            ) { Icon(Icons.Default.ContentPaste, null) }
+            ) { Icon(Icons.Default.Edit, null) }
         }
 
         Spacer(Modifier.height(16.dp))
