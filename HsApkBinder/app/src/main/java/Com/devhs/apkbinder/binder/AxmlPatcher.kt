@@ -94,10 +94,6 @@ object AxmlPatcher {
         return -1
     }
 
-    /**
-     * <application> খোঁজে: আগে নাম দিয়ে, না পেলে স্ট্রাকচার দিয়ে
-     * (ম্যানিফেস্টের শেষ চাইল্ড এলিমেন্টই সাধারণত <application>)।
-     */
     private fun findApplication(xml: ByteArray): Int {
         val pool = readPool(xml, 8)
         var pos = 8
@@ -125,6 +121,30 @@ object AxmlPatcher {
             p += if (size >= 8 && p + size <= xml.size) size else 4
         }
         return lastChild
+    }
+
+    /**
+     * সব START_ELEMENT চাঙ্কের size পুনরায় হিসাব করে, যাতে ইনসার্শনের পর
+     * কাঠামো ধারাবাহিক থাকে। এটাই ম্যানিফেস্ট ভাঙা রোধ করে।
+     */
+    private fun fixSizes(xml: ByteArray) {
+        val stack = ArrayList<Int>()
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            when (type) {
+                CHUNK_START_ELEMENT -> stack.add(pos)
+                CHUNK_END_ELEMENT -> {
+                    if (stack.isNotEmpty()) {
+                        val start = stack.removeAt(stack.size - 1)
+                        putI32(xml, start + 4, pos + size - start)
+                    }
+                }
+            }
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
+        }
+        putI32(xml, 4, xml.size)
     }
 
     fun readApplicationName(xml: ByteArray): String? = try {
@@ -203,10 +223,13 @@ object AxmlPatcher {
             )
         )
 
-        return insertBeforeApplication(
+        out = insertBeforeApplication(
             out,
             permissions.map { Element("uses-permission", listOf(Attr("name", ATTR_NAME, Value.Str(it)))) }
         )
+
+        fixSizes(out)
+        return out
     }
 
     private fun appendStrings(
@@ -219,7 +242,8 @@ object AxmlPatcher {
         val dataStart = stringDataBase(pool)
         val dataEnd = if (pool.styleCount > 0 && pool.stylesStart > 0) pool.start + pool.stylesStart
         else pool.start + pool.size
-        val oldData = xml.copyOfRange(dataStart, minOf(dataEnd, xml.size))
+        val safeEnd = if (dataEnd < dataStart) dataStart else minOf(dataEnd, xml.size)
+        val oldData = xml.copyOfRange(dataStart, safeEnd)
         val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
             xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
 
@@ -333,7 +357,12 @@ object AxmlPatcher {
         putI32(attr, 12, 8)
         attr[14] = TYPE_STRING.toByte()
         putI32(attr, 16, clsIdx)
-        return insertAt(xml, base + count * 20, attr)
+
+        val out = insertAt(xml, base + count * 20, attr)
+        val p = findApplication(out)
+        putU16(out, p + 28, count + 1)
+        putI32(out, p + 4, i32(out, p + 4) + 20)
+        return out
     }
 
     private fun insertChildren(xml: ByteArray, elements: List<Element>): ByteArray {
@@ -398,11 +427,7 @@ object AxmlPatcher {
             buf.writeI32(nameIdx)
         }
 
-        val block = buf.toByteArray()
-        val out = insertAt(xml, insertPos, block)
-        val appPos = findApplication(out)
-        putI32(out, appPos + 4, i32(out, appPos + 4) + block.size)
-        return out
+        return insertAt(xml, insertPos, buf.toByteArray())
     }
 
     private fun insertBeforeApplication(xml: ByteArray, elements: List<Element>): ByteArray {
@@ -485,6 +510,11 @@ object AxmlPatcher {
         b[o + 1] = (v shr 8).toByte()
         b[o + 2] = (v shr 16).toByte()
         b[o + 3] = (v shr 24).toByte()
+    }
+
+    private fun putU16(b: ByteArray, o: Int, v: Int) {
+        b[o] = v.toByte()
+        b[o + 1] = (v shr 8).toByte()
     }
 
     private fun ByteArrayOutputStream.writeU16(v: Int) {
