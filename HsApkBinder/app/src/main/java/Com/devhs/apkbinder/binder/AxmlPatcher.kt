@@ -123,10 +123,6 @@ object AxmlPatcher {
         return lastChild
     }
 
-    /**
-     * সব START_ELEMENT চাঙ্কের size পুনরায় হিসাব করে, যাতে ইনসার্শনের পর
-     * কাঠামো ধারাবাহিক থাকে। এটাই ম্যানিফেস্ট ভাঙা রোধ করে।
-     */
     private fun fixSizes(xml: ByteArray) {
         val stack = ArrayList<Int>()
         var pos = 8
@@ -327,6 +323,25 @@ object AxmlPatcher {
         return result
     }
 
+    /** অ্যাট্রিবিউটের typedValue ঠিক ২০ বাইট লেআউটে লেখে */
+    private fun ByteArrayOutputStream.writeAttr(nsIdx: Int, nameIdx: Int, raw: Int, type: Int, data: Int) {
+        writeI32(nsIdx)
+        writeI32(nameIdx)
+        writeI32(raw)
+        writeU16(8)
+        write(0)
+        write(type)
+        writeI32(data)
+    }
+
+    private fun setAttrString(b: ByteArray, a: Int, raw: Int, data: Int) {
+        putI32(b, a + 8, raw)
+        putU16(b, a + 12, 8)
+        b[a + 14] = 0
+        b[a + 15] = TYPE_STRING.toByte()
+        putI32(b, a + 16, data)
+    }
+
     private fun setApplicationName(xml: ByteArray, cls: String): ByteArray {
         val pos = findApplication(xml)
         require(pos >= 0) { "application element not found" }
@@ -341,11 +356,7 @@ object AxmlPatcher {
         for (i in 0 until count) {
             val a = base + i * 20
             if (matches(xml, pool, i32(xml, a + 4), "name")) {
-                putI32(xml, a + 8, clsIdx)
-                putI32(xml, a + 12, 8)
-                putI32(xml, a + 16, 0)
-                xml[a + 18] = TYPE_STRING.toByte()
-                putI32(xml, a + 16, clsIdx)
+                setAttrString(xml, a, clsIdx, clsIdx)
                 return xml
             }
         }
@@ -353,10 +364,7 @@ object AxmlPatcher {
         val attr = ByteArray(20)
         putI32(attr, 0, nsIdx)
         putI32(attr, 4, nameIdx)
-        putI32(attr, 8, clsIdx)
-        putI32(attr, 12, 8)
-        attr[14] = TYPE_STRING.toByte()
-        putI32(attr, 16, clsIdx)
+        setAttrString(attr, 0, clsIdx, clsIdx)
 
         val out = insertAt(xml, base + count * 20, attr)
         val p = findApplication(out)
@@ -391,31 +399,14 @@ object AxmlPatcher {
             buf.writeU16(0)
             buf.writeU16(0)
             el.attrs.forEach { at ->
-                buf.writeI32(nsIdx)
-                buf.writeI32(indexOf(xml, pool, at.name))
+                val attrNameIdx = indexOf(xml, pool, at.name)
                 when (val v = at.value) {
                     is Value.Str -> {
                         val idx = indexOf(xml, pool, v.v)
-                        buf.writeI32(idx)
-                        buf.writeI32(8)
-                        buf.writeI32(0)
-                        buf.writeU16(TYPE_STRING)
-                        buf.writeI32(idx)
+                        buf.writeAttr(nsIdx, attrNameIdx, idx, TYPE_STRING, idx)
                     }
-                    is Value.Ref -> {
-                        buf.writeI32(-1)
-                        buf.writeI32(8)
-                        buf.writeI32(0)
-                        buf.writeU16(TYPE_REFERENCE)
-                        buf.writeI32(v.v)
-                    }
-                    is Value.Dec -> {
-                        buf.writeI32(-1)
-                        buf.writeI32(8)
-                        buf.writeI32(0)
-                        buf.writeU16(TYPE_INT_DEC)
-                        buf.writeI32(v.v)
-                    }
+                    is Value.Ref -> buf.writeAttr(-1, attrNameIdx, -1, TYPE_REFERENCE, v.v)
+                    is Value.Dec -> buf.writeAttr(-1, attrNameIdx, -1, TYPE_INT_DEC, v.v)
                 }
             }
             buf.writeU16(CHUNK_END_ELEMENT)
@@ -455,13 +446,7 @@ object AxmlPatcher {
             buf.writeU16(0)
             buf.writeU16(0)
             buf.writeU16(0)
-            buf.writeI32(nsIdx)
-            buf.writeI32(nameIdx)
-            buf.writeI32(valueIdx)
-            buf.writeI32(8)
-            buf.writeI32(0)
-            buf.writeU16(TYPE_STRING)
-            buf.writeI32(valueIdx)
+            buf.writeAttr(nsIdx, nameIdx, valueIdx, TYPE_STRING, valueIdx)
             buf.writeU16(CHUNK_END_ELEMENT)
             buf.writeU16(16)
             buf.writeI32(24)
