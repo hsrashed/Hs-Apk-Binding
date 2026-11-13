@@ -197,7 +197,22 @@ object AxmlPatcher {
             }
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
-        return "strings=" + pool.count + " app=" + app + " activity=" + act + " usesSdk=" + sdk
+
+        val head = StringBuilder()
+        for (i in 0 until minOf(48, xml.size)) head.append(String.format("%02X", xml[i]))
+
+        val sample = StringBuilder()
+        for (i in 0 until minOf(pool.count, 6)) {
+            sample.append(i).append('=')
+            sample.append(decodeAt(xml, stringOffset(xml, pool, i), true) ?: "?")
+            sample.append('|')
+        }
+
+        return "strings=" + pool.count + " app=" + app + " activity=" + act + " usesSdk=" + sdk +
+            " hs=" + pool.headerSize + " ss=" + pool.stringsStart +
+            " sc=" + pool.styleCount + " fl=" + pool.flags + " size=" + xml.size +
+            "\nHEAD=" + head +
+            "\nSAMPLE=" + sample
     }
 
     fun readApplicationName(xml: ByteArray): String? = try {
