@@ -14,7 +14,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
@@ -62,7 +62,7 @@ fun TerminalConsole(logs: List<LogLine>, onClear: () -> Unit, modifier: Modifier
                 modifier = Modifier.weight(1f)
             )
             IconButton(onClick = onClear, modifier = Modifier.size(32.dp)) {
-                Icon(Icons.Default.DeleteSweep, null, tint = TextMuted, modifier = Modifier.size(16.dp))
+                Icon(Icons.Default.Delete, null, tint = TextMuted, modifier = Modifier.size(16.dp))
             }
         }
         LazyColumn(
