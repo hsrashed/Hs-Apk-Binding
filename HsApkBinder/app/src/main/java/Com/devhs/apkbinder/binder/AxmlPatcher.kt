@@ -180,6 +180,26 @@ object AxmlPatcher {
         if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
     }
 
+    fun stats(xml: ByteArray): String {
+        val pool = readPool(xml, 8)
+        var app = 0
+        var act = 0
+        var sdk = 0
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (type == CHUNK_START_ELEMENT) {
+                val n = i32(xml, pos + 20)
+                if (matches(xml, pool, n, "application")) app++
+                if (matches(xml, pool, n, "activity")) act++
+                if (matches(xml, pool, n, "uses-sdk")) sdk++
+            }
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
+        }
+        return "strings=" + pool.count + " app=" + app + " activity=" + act + " usesSdk=" + sdk
+    }
+
     fun readApplicationName(xml: ByteArray): String? = try {
         val pos = findApplication(xml)
         if (pos < 0) null else {
