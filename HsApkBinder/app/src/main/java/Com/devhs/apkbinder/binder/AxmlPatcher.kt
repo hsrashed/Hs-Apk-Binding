@@ -182,9 +182,11 @@ object AxmlPatcher {
 
     fun stats(xml: ByteArray): String {
         val pool = readPool(xml, 8)
+        val base = stringDataBase(pool)
+        val utf8 = (pool.flags and FLAG_UTF8) != 0
+
         var app = 0
         var act = 0
-        var sdk = 0
         var pos = 8
         while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
@@ -193,25 +195,36 @@ object AxmlPatcher {
                 val n = i32(xml, pos + 20)
                 if (matches(xml, pool, n, "application")) app++
                 if (matches(xml, pool, n, "activity")) act++
-                if (matches(xml, pool, n, "uses-sdk")) sdk++
             }
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
 
-        val head = StringBuilder()
-        for (i in 0 until minOf(48, xml.size)) head.append(String.format("%02X", xml[i]))
+        val offs = StringBuilder()
+        for (i in 0 until minOf(4, pool.count)) {
+            offs.append(i).append(':').append(i32(xml, pool.start + pool.headerSize + i * 4)).append(' ')
+        }
+
+        val raw = StringBuilder()
+        for (i in 0 until minOf(24, xml.size - base)) raw.append(String.format("%02X", xml[base + i]))
 
         val sample = StringBuilder()
-        for (i in 0 until minOf(pool.count, 6)) {
+        for (i in 0 until minOf(pool.count, 5)) {
             sample.append(i).append('=')
-            sample.append(decodeAt(xml, stringOffset(xml, pool, i), true) ?: "?")
+            sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
 
-        return "strings=" + pool.count + " app=" + app + " activity=" + act + " usesSdk=" + sdk +
-            " hs=" + pool.headerSize + " ss=" + pool.stringsStart +
-            " sc=" + pool.styleCount + " fl=" + pool.flags + " size=" + xml.size +
-            "\nHEAD=" + head +
+        var ok = 0
+        for (i in 0 until pool.count) {
+            val s = decodeAt(xml, stringOffset(xml, pool, i), utf8)
+            if (!s.isNullOrEmpty()) ok++
+        }
+
+        return "strings=" + pool.count + " app=" + app + " activity=" + act +
+            " hs=" + pool.headerSize + " ss=" + pool.stringsStart + " fl=" + pool.flags +
+            " size=" + xml.size + " base=" + base + " utf8=" + utf8 + " decoded=" + ok +
+            "\nOFFS=" + offs +
+            "\nRAWDATA=" + raw +
             "\nSAMPLE=" + sample
     }
 
