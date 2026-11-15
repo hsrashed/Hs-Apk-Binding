@@ -80,13 +80,16 @@ class BinderEngine(private val ctx: Context) {
             } else {
                 emit(LogLevel.INFO, "Original package: " + originalInfo.packageName)
                 emit(LogLevel.INFO, "Original activities: " + (originalInfo.activities?.size ?: 0))
-                emit(
-                    LogLevel.INFO,
-                    "extractNativeLibs: " + (originalInfo.applicationInfo?.extractNativeLibs ?: true)
-                )
             }
 
             val srcZip = ZipFile(base)
+            val allEntries = srcZip.entries().toList()
+            emit(
+                LogLevel.INFO,
+                "Entries: " + allEntries.size + "  stored: " +
+                    allEntries.count { it.method == ZipEntry.STORED }
+            )
+
             val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
                 ?: throw IllegalStateException("No AndroidManifest.xml in APK")
             val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
@@ -119,7 +122,7 @@ class BinderEngine(private val ctx: Context) {
             }
             emit(LogLevel.INFO, "Dex files: " + dexes.size)
 
-            val maxDex = srcZip.entries().toList()
+            val maxDex = allEntries
                 .mapNotNull { Regex("^classes(\\d*)\\.dex$").find(it.name) }
                 .map { it.groupValues[1].ifEmpty { "1" }.toInt() }
                 .maxOrNull() ?: 0
@@ -134,7 +137,7 @@ class BinderEngine(private val ctx: Context) {
 
             val unsigned = File(work, "unsigned.apk")
             ZipOutputStream(FileOutputStream(unsigned).buffered()).use { zos ->
-                for (e in srcZip.entries().toList()) {
+                for (e in allEntries) {
                     if (e.isDirectory) continue
                     if (e.name == "AndroidManifest.xml") continue
                     if (e.name == "assets/" + Const.CONFIG_ASSET) continue
