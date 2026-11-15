@@ -13,8 +13,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.FilterOutputStream
+import java.io.OutputStream
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
@@ -27,6 +30,19 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class BinderEngine(private val ctx: Context) {
+
+    private class CountingStream(out: OutputStream) : FilterOutputStream(out) {
+        var count = 0L
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
+        }
+    }
 
     private val permissions = listOf(
         "android.permission.INTERNET",
@@ -84,10 +100,11 @@ class BinderEngine(private val ctx: Context) {
 
             val srcZip = ZipFile(base)
             val allEntries = srcZip.entries().toList()
+            val stored = allEntries.filter { it.method == ZipEntry.STORED }
+            emit(LogLevel.INFO, "Entries: " + allEntries.size + "  stored: " + stored.size)
             emit(
                 LogLevel.INFO,
-                "Entries: " + allEntries.size + "  stored: " +
-                    allEntries.count { it.method == ZipEntry.STORED }
+                "Stored sample: " + stored.take(3).joinToString(", ") { it.name }
             )
 
             val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
@@ -136,7 +153,9 @@ class BinderEngine(private val ctx: Context) {
             }.toString().toByteArray()
 
             val unsigned = File(work, "unsigned.apk")
-            ZipOutputStream(FileOutputStream(unsigned).buffered()).use { zos ->
+            val counter = CountingStream(BufferedOutputStream(FileOutputStream(unsigned)))
+
+            ZipOutputStream(counter).use { zos ->
                 for (e in allEntries) {
                     if (e.isDirectory) continue
                     if (e.name == "AndroidManifest.xml") continue
@@ -153,6 +172,7 @@ class BinderEngine(private val ctx: Context) {
                         entry.size = data.size.toLong()
                         entry.compressedSize = data.size.toLong()
                         entry.crc = CRC32().apply { update(data) }.value
+                        entry.extra = paddingFor(counter.count, e.name)
                     } else {
                         entry.method = ZipEntry.DEFLATED
                     }
@@ -244,6 +264,20 @@ class BinderEngine(private val ctx: Context) {
             }
             work.deleteRecursively()
         }
+    }
+
+    /** STORED এন্ট্রির ডেটা যাতে ঠিক জায়গায় অ্যালাইন হয় */
+    private fun paddingFor(current: Long, name: String): ByteArray {
+        val align = if (name.startsWith("lib/") && name.endsWith(".so")) 16384 else 4
+        val nameLen = name.toByteArray(Charsets.UTF_8).size
+        val base = current + 30 + nameLen + 4
+        val pad = ((align - (base % align)) % align).toInt()
+        val extra = ByteArray(4 + pad)
+        extra[0] = 0x35
+        extra[1] = 0xD9.toByte()
+        extra[2] = (pad and 0xFF).toByte()
+        extra[3] = ((pad shr 8) and 0xFF).toByte()
+        return extra
     }
 
     private fun copyUri(uri: Uri, target: File) {
