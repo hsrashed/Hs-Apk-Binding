@@ -97,6 +97,17 @@ object AxmlPatcher {
         return -1
     }
 
+    private fun firstElement(xml: ByteArray): Int {
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (type == CHUNK_START_ELEMENT) return pos
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
+        }
+        return -1
+    }
+
     private fun findApplication(xml: ByteArray): Int {
         val pool = readPool(xml, 8)
         var pos = 8
@@ -126,24 +137,9 @@ object AxmlPatcher {
         return lastChild
     }
 
-    private fun fixSizes(xml: ByteArray) {
-        val stack = ArrayList<Int>()
-        var pos = 8
-        while (pos + 8 <= xml.size) {
-            val type = u16(xml, pos)
-            val size = i32(xml, pos + 4)
-            when (type) {
-                CHUNK_START_ELEMENT -> stack.add(pos)
-                CHUNK_END_ELEMENT -> {
-                    if (stack.isNotEmpty()) {
-                        val start = stack.removeAt(stack.size - 1)
-                        putI32(xml, start + 4, pos + size - start)
-                    }
-                }
-            }
-            pos += if (size >= 8 && pos + size <= xml.size) size else 4
-        }
-        putI32(xml, 4, xml.size)
+    private fun grow(xml: ByteArray, pos: Int, delta: Int) {
+        if (pos < 0 || pos + 8 > xml.size) return
+        putI32(xml, pos + 4, i32(xml, pos + 4) + delta)
     }
 
     private fun mapId(xml: ByteArray, stringIndex: Int): Int {
@@ -177,7 +173,6 @@ object AxmlPatcher {
             pos += size
         }
         if (elements == 0) throw IllegalStateException("no elements")
-
         if (mapId(xml, nameSlot) != ATTR_NAME) throw IllegalStateException("android:name id missing")
         if (mapId(xml, themeSlot) != ATTR_THEME) throw IllegalStateException("android:theme id missing")
         if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
@@ -185,9 +180,7 @@ object AxmlPatcher {
 
     fun stats(xml: ByteArray): String {
         val pool = readPool(xml, 8)
-        val base = stringDataBase(pool)
         val utf8 = (pool.flags and FLAG_UTF8) != 0
-
         var app = 0
         var act = 0
         var pos = 8
@@ -201,17 +194,14 @@ object AxmlPatcher {
             }
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
-
         val sample = StringBuilder()
         for (i in 0 until minOf(pool.count, 6)) {
             sample.append(i).append('=')
             sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
-
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
-            " utf8=" + utf8 + " size=" + xml.size +
-            "\nSAMPLE=" + sample
+            " utf8=" + utf8 + " size=" + xml.size + "\nSAMPLE=" + sample
     }
 
     fun readApplicationName(xml: ByteArray): String? = try {
@@ -295,7 +285,6 @@ object AxmlPatcher {
 
         out = insertBeforeApplication(out, slot(6), slot(0), slot(3), slot(10), permissions.size)
 
-        fixSizes(out)
         validate(out, slot(0), slot(1), slot(2))
         return out
     }
@@ -377,7 +366,6 @@ object AxmlPatcher {
             putU16(block, 2, 8)
             putI32(block, 4, 8 + needed * 4)
             ids.forEach { (i, id) -> if (i < needed) putI32(block, 8 + i * 4, id) }
-
             val out = ByteArrayOutputStream()
             out.write(xml, 0, pos)
             out.write(block)
@@ -442,10 +430,12 @@ object AxmlPatcher {
         putI32(attr, 4, nameSlot)
         setAttrString(attr, 0, valueSlot, valueSlot)
 
+        val root = firstElement(xml)
         val out = insertAt(xml, base + count * 20, attr)
         val p = findApplication(out)
         putU16(out, p + 28, count + 1)
-        putI32(out, p + 4, i32(out, p + 4) + 20)
+        grow(out, p, 20)
+        grow(out, root, 20)
         return out
     }
 
@@ -486,7 +476,13 @@ object AxmlPatcher {
             buf.writeI32(el.nameSlot)
         }
 
-        return insertAt(xml, insertPos, buf.toByteArray())
+        val block = buf.toByteArray()
+        val root = firstElement(xml)
+        val out = insertAt(xml, insertPos, block)
+        val app = findApplication(out)
+        grow(out, app, block.size)
+        grow(out, root, block.size)
+        return out
     }
 
     private fun insertBeforeApplication(
@@ -525,7 +521,11 @@ object AxmlPatcher {
             buf.writeI32(-1)
             buf.writeI32(elemSlot)
         }
-        return insertAt(xml, pos, buf.toByteArray())
+        val block = buf.toByteArray()
+        val root = firstElement(xml)
+        val out = insertAt(xml, pos, block)
+        grow(out, root, block.size)
+        return out
     }
 
     private fun insertAt(xml: ByteArray, pos: Int, block: ByteArray): ByteArray {
