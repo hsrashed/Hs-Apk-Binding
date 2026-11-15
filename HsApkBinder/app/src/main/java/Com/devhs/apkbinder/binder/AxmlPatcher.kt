@@ -126,7 +126,6 @@ object AxmlPatcher {
         return lastChild
     }
 
-    /** সব এলিমেন্টের size পুনরায় হিসাব করে — ইনসার্শনের পর কাঠামো ঠিক রাখে */
     private fun fixSizes(xml: ByteArray) {
         val stack = ArrayList<Int>()
         var pos = 8
@@ -207,6 +206,33 @@ object AxmlPatcher {
         }
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
             " utf8=" + utf8 + " size=" + xml.size + "\nSAMPLE=" + sample
+    }
+
+    fun appAttrs(xml: ByteArray): String {
+        val pos = findApplication(xml)
+        if (pos < 0) return "(no application)"
+        val pool = readPool(xml, 8)
+        val utf8 = (pool.flags and FLAG_UTF8) != 0
+        val count = u16(xml, pos + 28)
+        val sb = StringBuilder("attrs=")
+        sb.append(count)
+        sb.append(" [")
+        for (i in 0 until count) {
+            val a = pos + 36 + i * 20
+            val ni = i32(xml, a + 4)
+            val type = xml[a + 15].toInt() and 0xFF
+            val data = i32(xml, a + 16)
+            sb.append(i).append(':')
+            sb.append(decodeAt(xml, stringOffset(xml, pool, ni), utf8) ?: "?")
+            sb.append("(t=").append(type).append(",d=").append(data)
+            if (type == TYPE_STRING) {
+                sb.append(",s=")
+                sb.append(decodeAt(xml, stringOffset(xml, pool, data), utf8) ?: "?")
+            }
+            sb.append(") ")
+        }
+        sb.append(']')
+        return sb.toString()
     }
 
     fun readApplicationName(xml: ByteArray): String? = try {
