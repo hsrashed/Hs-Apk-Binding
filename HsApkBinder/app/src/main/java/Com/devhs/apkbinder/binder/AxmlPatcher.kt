@@ -69,12 +69,15 @@ object AxmlPatcher {
                 else String(xml, b.second, b.first, Charsets.UTF_8)
             }
         } else {
-            val a = readVarint(xml, off)
-            if (a == null || a.second + a.first * 2 > xml.size) null
-            else {
-                val sb = StringBuilder(a.first)
-                for (i in 0 until a.first) sb.append(u16(xml, a.second + i * 2).toChar())
-                sb.toString()
+            if (off + 2 > xml.size) null else {
+                val len = u16(xml, off)
+                val p = off + 2
+                if (p + len * 2 > xml.size) null
+                else {
+                    val sb = StringBuilder(len)
+                    for (i in 0 until len) sb.append(u16(xml, p + i * 2).toChar())
+                    sb.toString()
+                }
             }
         }
     } catch (_: Throwable) {
@@ -199,32 +202,15 @@ object AxmlPatcher {
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
 
-        val offs = StringBuilder()
-        for (i in 0 until minOf(4, pool.count)) {
-            offs.append(i).append(':').append(i32(xml, pool.start + pool.headerSize + i * 4)).append(' ')
-        }
-
-        val raw = StringBuilder()
-        for (i in 0 until minOf(24, xml.size - base)) raw.append(String.format("%02X", xml[base + i]))
-
         val sample = StringBuilder()
-        for (i in 0 until minOf(pool.count, 5)) {
+        for (i in 0 until minOf(pool.count, 6)) {
             sample.append(i).append('=')
             sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
 
-        var ok = 0
-        for (i in 0 until pool.count) {
-            val s = decodeAt(xml, stringOffset(xml, pool, i), utf8)
-            if (!s.isNullOrEmpty()) ok++
-        }
-
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
-            " hs=" + pool.headerSize + " ss=" + pool.stringsStart + " fl=" + pool.flags +
-            " size=" + xml.size + " base=" + base + " utf8=" + utf8 + " decoded=" + ok +
-            "\nOFFS=" + offs +
-            "\nRAWDATA=" + raw +
+            " utf8=" + utf8 + " size=" + xml.size +
             "\nSAMPLE=" + sample
     }
 
@@ -338,7 +324,8 @@ object AxmlPatcher {
                 data.write(bytes)
                 data.write(0)
             } else {
-                writeVarint(data, s.length)
+                data.write(s.length and 0xFF)
+                data.write((s.length shr 8) and 0xFF)
                 for (ch in s) {
                     data.write(ch.code and 0xFF)
                     data.write((ch.code shr 8) and 0xFF)
