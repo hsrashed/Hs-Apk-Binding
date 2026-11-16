@@ -175,7 +175,7 @@ object AxmlPatcher {
     private fun emit(n: Node, out: ByteArrayOutputStream) {
         val raw = n.raw
         if (raw != null) {
-            out.write(raw)
+            out.write(raw, 0, raw.size)
             return
         }
         out.writeU16(CHUNK_START_ELEMENT)
@@ -191,7 +191,8 @@ object AxmlPatcher {
         out.writeU16(0)
         out.writeU16(0)
         out.writeU16(0)
-        out.write(n.attrBytes!!.toByteArray())
+        val ab = n.attrBytes!!.toByteArray()
+        out.write(ab, 0, ab.size)
         for (c in n.children) emit(c, out)
         out.writeU16(CHUNK_END_ELEMENT)
         out.writeU16(16)
@@ -212,7 +213,7 @@ object AxmlPatcher {
     }
 
     private fun appendAttr(n: Node, bytes: ByteArray) {
-        n.attrBytes!!.write(bytes)
+        n.attrBytes!!.write(bytes, 0, bytes.size)
         n.attrCount++
     }
 
@@ -240,8 +241,7 @@ object AxmlPatcher {
         while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
             val size = i32(xml, pos + 4)
-            // Fix: Ensuring chunk size and boundaries are correct
-            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at $pos")
+            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at " + pos)
             if (type == CHUNK_START_ELEMENT) {
                 elements++
                 val nameIdx = i32(xml, pos + 20)
@@ -378,7 +378,6 @@ object AxmlPatcher {
         val application = findByName(root, withStrings, pool, "application")
             ?: throw IllegalStateException("application element not found")
 
-        // ১. android:name রিপ্লেস বা যোগ করা
         var replaced = false
         val attrs = application.attrBytes!!.toByteArray()
         for (i in 0 until application.attrCount) {
@@ -393,14 +392,13 @@ object AxmlPatcher {
                 break
             }
         }
-        application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
+        application.attrBytes = ByteArrayOutputStream().apply { write(attrs, 0, attrs.size) }
         if (!replaced) {
             val one = ByteArrayOutputStream()
             one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
             appendAttr(application, one.toByteArray())
         }
 
-        // ২. Activity এবং Service যোগ করা (ইনস্টল এরর ফিক্স করার জন্য সঠিক ফরম্যাটে)
         val gate = makeElement(
             slot(4),
             listOf(
@@ -418,7 +416,6 @@ object AxmlPatcher {
         application.children.add(0, service)
         application.children.add(0, gate)
 
-        // ৩. পারমিশন যোগ করা (manifest-এ, application-এর ঠিক আগে)
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
             val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
@@ -432,7 +429,6 @@ object AxmlPatcher {
         val result = out.toByteArray()
         putI32(result, 4, result.size)
 
-        // Validation সঠিকভাবে করার জন্য ResourceMap আপডেট নিশ্চিত করা
         validate(result, slot(0), slot(1), slot(2))
         return result
     }
@@ -446,12 +442,11 @@ object AxmlPatcher {
         val safeEnd = if (dataEnd < dataStart) dataStart else minOf(dataEnd, xml.size)
         val oldData = xml.copyOfRange(dataStart, safeEnd)
         
-        // Style Data সঠিকভাবে কপি করা
         val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
             xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
 
         val data = ByteArrayOutputStream()
-        data.write(oldData)
+        data.write(oldData, 0, oldData.size)
         val newOffsets = IntArray(added.size)
         
         for ((i, s) in added.withIndex()) {
@@ -461,7 +456,7 @@ object AxmlPatcher {
                 writeVarint(data, s.length)
                 val bytes = s.toByteArray(Charsets.UTF_8)
                 writeVarint(data, bytes.size)
-                data.write(bytes)
+                data.write(bytes, 0, bytes.size)
                 data.write(0)
             } else {
                 data.write(s.length and 0xFF)
@@ -493,17 +488,14 @@ object AxmlPatcher {
         out.writeI32(stringsStart)
         out.writeI32(stylesStart)
         
-        // পুরনো অফসেটগুলো কপি করা
         for (i in 0 until pool.count) out.writeI32(i32(xml, pool.start + pool.headerSize + i * 4))
-        // নতুন অফসেটগুলো যোগ করা
         newOffsets.forEach { out.writeI32(it) }
-        // পুরনো স্টাইল অফসেটগুলো কপি করা
         for (i in 0 until pool.styleCount) {
             out.writeI32(i32(xml, pool.start + pool.headerSize + pool.count * 4 + i * 4))
         }
         
-        out.write(newData)
-        out.write(styleData)
+        out.write(newData, 0, newData.size)
+        out.write(styleData, 0, styleData.size)
         out.write(xml, pool.start + pool.size, xml.size - pool.start - pool.size)
 
         val result = out.toByteArray()
@@ -524,7 +516,7 @@ object AxmlPatcher {
             ids.forEach { (i, id) -> if (i < needed) putI32(block, 8 + i * 4, id) }
             val out = ByteArrayOutputStream()
             out.write(xml, 0, pos)
-            out.write(block)
+            out.write(block, 0, block.size)
             out.write(xml, pos, xml.size - pos)
             val result = out.toByteArray()
             putI32(result, 4, result.size)
@@ -533,7 +525,6 @@ object AxmlPatcher {
 
         val mapSize = i32(xml, pos + 4)
         val entries = (mapSize - 8) / 4
-        // Fix: Grow the map to cover the new string pool size
         val grow = (needed - entries).coerceAtLeast(0)
 
         val out = ByteArrayOutputStream()
