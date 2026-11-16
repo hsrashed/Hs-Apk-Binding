@@ -131,6 +131,13 @@ fun HomeScreen() {
             try {
                 val dirDoc = DocumentFile.fromTreeUri(ctx, dir)
                     ?: throw IllegalStateException("Invalid output folder")
+                
+                // FIX: BinderEngine(ctx).bind(...) এর বদলে আপনার BinderEngine.kt এর স্ট্রাকচার অনুযায়ী কল করুন
+                // যদি BinderEngine একটি object হয়, তবে: BinderEngine.bind(ctx, ...)
+                // যদি BinderEngine একটি class হয়, তবে: BinderEngine(ctx).bind(...)
+                // যেহেতু আপনার আগের কোডে BinderEngine(ctx) ছিল, আমি সেটাই রেখেছি।
+                // তবে নিশ্চিত করুন BinderEngine.kt এ class BinderEngine(val context: Context) { fun bind(...) } আছে।
+                
                 BinderEngine(ctx).bind(
                     source = uri,
                     activity = activityInput.trim(),
@@ -292,7 +299,8 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
         }
     }
 
-    val filtered = apps.filter {
+    // FIX: Explicit Type declaration for filtered list
+    val filtered: List<ApplicationInfo> = apps.filter {
         query.isBlank() || it.loadLabel(ctx.packageManager).toString().contains(query, true)
     }
 
@@ -324,7 +332,8 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
                         Modifier.heightIn(max = 380.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        items(filtered) { info ->
+                        // FIX: Explicit type for item
+                        items(filtered) { info: ApplicationInfo ->
                             Row(
                                 Modifier
                                     .fillMaxWidth()
