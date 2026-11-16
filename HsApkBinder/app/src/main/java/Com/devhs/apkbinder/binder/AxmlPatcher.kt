@@ -39,6 +39,16 @@ object AxmlPatcher {
         val stylesStart: Int
     )
 
+    private class Node {
+        var type = 0
+        var raw: ByteArray? = null
+        var attrBytes: ByteArrayOutputStream? = null
+        var attrCount = 0
+        var nameIdx = 0
+        val children = ArrayList<Node>()
+        var size = 0
+    }
+
     private fun readPool(xml: ByteArray, start: Int): Pool = Pool(
         start = start,
         size = i32(xml, start + 4),
@@ -92,11 +102,6 @@ object AxmlPatcher {
         return decodeAt(xml, off, !declared) == target
     }
 
-    private fun indexOf(xml: ByteArray, pool: Pool, target: String): Int {
-        for (i in 0 until pool.count) if (matches(xml, pool, i, target)) return i
-        return -1
-    }
-
     private fun findApplication(xml: ByteArray): Int {
         val pool = readPool(xml, 8)
         var pos = 8
@@ -108,42 +113,7 @@ object AxmlPatcher {
             }
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
-
-        var p = 8
-        var depth = 0
-        var lastChild = -1
-        while (p + 8 <= xml.size) {
-            val type = u16(xml, p)
-            val size = i32(xml, p + 4)
-            if (type == CHUNK_START_ELEMENT) {
-                depth++
-                if (depth == 2) lastChild = p
-            } else if (type == CHUNK_END_ELEMENT) {
-                depth--
-            }
-            p += if (size >= 8 && p + size <= xml.size) size else 4
-        }
-        return lastChild
-    }
-
-    private fun fixSizes(xml: ByteArray) {
-        val stack = ArrayList<Int>()
-        var pos = 8
-        while (pos + 8 <= xml.size) {
-            val type = u16(xml, pos)
-            val size = i32(xml, pos + 4)
-            when (type) {
-                CHUNK_START_ELEMENT -> stack.add(pos)
-                CHUNK_END_ELEMENT -> {
-                    if (stack.isNotEmpty()) {
-                        val start = stack.removeAt(stack.size - 1)
-                        putI32(xml, start + 4, pos + size - start)
-                    }
-                }
-            }
-            pos += if (size >= 8 && pos + size <= xml.size) size else 4
-        }
-        putI32(xml, 4, xml.size)
+        return -1
     }
 
     private fun mapId(xml: ByteArray, stringIndex: Int): Int {
@@ -154,6 +124,117 @@ object AxmlPatcher {
         if (stringIndex < 0 || stringIndex >= entries) return 0
         return i32(xml, pos + 8 + stringIndex * 4)
     }
+
+    // ---------------- ট্রি পার্স ও এমিট ----------------
+
+    private fun parse(xml: ByteArray): Node {
+        val root = Node().apply { type = -1 }
+        val stack = ArrayList<Node>()
+        stack.add(root)
+        var pos = 8
+        while (pos + 8 <= xml.size) {
+            val type = u16(xml, pos)
+            val size = i32(xml, pos + 4)
+            if (size < 8 || pos + size > xml.size) break
+            if (type == CHUNK_START_ELEMENT) {
+                val node = Node()
+                node.type = type
+                node.nameIdx = i32(xml, pos + 20)
+                node.attrCount = u16(xml, pos + 28)
+                val buf = ByteArrayOutputStream()
+                buf.write(xml, pos + 36, node.attrCount * 20)
+                node.attrBytes = buf
+                stack[stack.size - 1].children.add(node)
+                stack.add(node)
+            } else if (type == CHUNK_END_ELEMENT) {
+                if (stack.size > 1) stack.removeAt(stack.size - 1)
+            } else {
+                val node = Node()
+                node.type = type
+                node.raw = xml.copyOfRange(pos, pos + size)
+                stack[stack.size - 1].children.add(node)
+            }
+            pos += size
+        }
+        return root
+    }
+
+    private fun measure(n: Node) {
+        val raw = n.raw
+        if (raw != null) {
+            n.size = raw.size
+            return
+        }
+        var total = 36 + n.attrCount * 20
+        for (c in n.children) {
+            measure(c)
+            total += c.size
+        }
+        n.size = total
+    }
+
+    private fun emit(n: Node, out: ByteArrayOutputStream) {
+        val raw = n.raw
+        if (raw != null) {
+            out.write(raw)
+            return
+        }
+        out.writeU16(CHUNK_START_ELEMENT)
+        out.writeU16(16)
+        out.writeI32(n.size)
+        out.writeI32(1)
+        out.writeI32(-1)
+        out.writeI32(-1)
+        out.writeI32(n.nameIdx)
+        out.writeU16(20)
+        out.writeU16(20)
+        out.writeU16(n.attrCount)
+        out.writeU16(0)
+        out.writeU16(0)
+        out.writeU16(0)
+        out.write(n.attrBytes!!.toByteArray())
+        for (c in n.children) emit(c, out)
+        out.writeU16(CHUNK_END_ELEMENT)
+        out.writeU16(16)
+        out.writeI32(24)
+        out.writeI32(1)
+        out.writeI32(-1)
+        out.writeI32(-1)
+        out.writeI32(n.nameIdx)
+    }
+
+    private fun findByName(n: Node, xml: ByteArray, pool: Pool, name: String): Node? {
+        if (n.raw == null && matches(xml, pool, n.nameIdx, name)) return n
+        for (c in n.children) {
+            val hit = findByName(c, xml, pool, name)
+            if (hit != null) return hit
+        }
+        return null
+    }
+
+    private fun appendAttr(n: Node, bytes: ByteArray) {
+        n.attrBytes!!.write(bytes)
+        n.attrCount++
+    }
+
+    private fun makeElement(slot: Int, attrs: List<Attr>): Node {
+        val node = Node()
+        node.type = CHUNK_START_ELEMENT
+        node.nameIdx = slot
+        val buf = ByteArrayOutputStream()
+        attrs.forEach { a ->
+            when (val v = a.value) {
+                is Value.Str -> buf.writeAttr(-1, a.nameSlot, v.slot, TYPE_STRING, v.slot)
+                is Value.Ref -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_REFERENCE, v.v)
+                is Value.Dec -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_DEC, v.v)
+            }
+        }
+        node.attrBytes = buf
+        node.attrCount = attrs.size
+        return node
+    }
+
+    // ---------------- যাচাই ----------------
 
     private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
         val pool = readPool(xml, 8)
@@ -262,6 +343,8 @@ object AxmlPatcher {
         null
     }
 
+    // ---------------- মূল প্যাচ ----------------
+
     fun patch(
         xml: ByteArray,
         newAppClass: String,
@@ -290,35 +373,71 @@ object AxmlPatcher {
         attrIds[slot(1)] = ATTR_THEME
         attrIds[slot(2)] = ATTR_FG_TYPE
 
-        var out = appendStrings(xml, added, attrIds)
-        out = setApplicationName(out, slot(3), slot(0), slot(7))
+        val withStrings = appendStrings(xml, added, attrIds)
+        val pool = readPool(withStrings, 8)
+        val root = parse(withStrings)
 
-        out = insertChildren(
-            out,
+        val manifest = findByName(root, withStrings, pool, "manifest")
+            ?: throw IllegalStateException("manifest element not found")
+        val application = findByName(root, withStrings, pool, "application")
+            ?: throw IllegalStateException("application element not found")
+
+        // android:name রিপ্লেস বা যোগ
+        var replaced = false
+        val attrs = application.attrBytes!!.toByteArray()
+        for (i in 0 until application.attrCount) {
+            val a = i * 20
+            if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
+                putI32(attrs, a + 8, slot(7))
+                putU16(attrs, a + 12, 8)
+                attrs[a + 14] = 0
+                attrs[a + 15] = TYPE_STRING.toByte()
+                putI32(attrs, a + 16, slot(7))
+                replaced = true
+                break
+            }
+        }
+        application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
+        if (!replaced) {
+            val one = ByteArrayOutputStream()
+            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
+            appendAttr(application, one.toByteArray())
+        }
+
+        // activity + service যোগ (application-এর শুরুতে)
+        val gate = makeElement(
+            slot(4),
             listOf(
-                Element(
-                    slot(4),
-                    listOf(
-                        Attr(slot(0), Value.Str(slot(8))),
-                        Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
-                    )
-                ),
-                Element(
-                    slot(5),
-                    listOf(
-                        Attr(slot(0), Value.Str(slot(9))),
-                        Attr(slot(2), Value.Dec(1))
-                    )
-                )
-            ),
-            slot(3)
+                Attr(slot(0), Value.Str(slot(8))),
+                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
+            )
         )
+        val service = makeElement(
+            slot(5),
+            listOf(
+                Attr(slot(0), Value.Str(slot(9))),
+                Attr(slot(2), Value.Dec(1))
+            )
+        )
+        application.children.add(0, service)
+        application.children.add(0, gate)
 
-        out = insertBeforeApplication(out, slot(6), slot(0), slot(3), slot(10), permissions.size)
+        // পারমিশন যোগ (manifest-এ, application-এর আগে)
+        val index = manifest.children.indexOf(application)
+        for (i in 0 until permissions.size) {
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
+            manifest.children.add(index, perm)
+        }
 
-        fixSizes(out)
-        validate(out, slot(0), slot(1), slot(2))
-        return out
+        measure(root)
+        val out = ByteArrayOutputStream()
+        out.write(withStrings, 0, 8)
+        for (c in root.children) emit(c, out)
+        val result = out.toByteArray()
+        putI32(result, 4, result.size)
+
+        validate(result, slot(0), slot(1), slot(2))
+        return result
     }
 
     private fun appendStrings(xml: ByteArray, added: List<String>, attrIds: Map<Int, Int>): ByteArray {
@@ -431,130 +550,6 @@ object AxmlPatcher {
         write(0)
         write(type)
         writeI32(data)
-    }
-
-    private fun setAttrString(b: ByteArray, a: Int, raw: Int, data: Int) {
-        putI32(b, a + 8, raw)
-        putU16(b, a + 12, 8)
-        b[a + 14] = 0
-        b[a + 15] = TYPE_STRING.toByte()
-        putI32(b, a + 16, data)
-    }
-
-    private fun setApplicationName(xml: ByteArray, nsSlot: Int, nameSlot: Int, valueSlot: Int): ByteArray {
-        val pos = findApplication(xml)
-        require(pos >= 0) { "application element not found" }
-
-        val pool = readPool(xml, 8)
-        val count = u16(xml, pos + 28)
-        val base = pos + 36
-
-        for (i in 0 until count) {
-            val a = base + i * 20
-            if (matches(xml, pool, i32(xml, a + 4), "name")) {
-                setAttrString(xml, a, valueSlot, valueSlot)
-                return xml
-            }
-        }
-
-        val attr = ByteArray(20)
-        putI32(attr, 0, nsSlot)
-        putI32(attr, 4, nameSlot)
-        setAttrString(attr, 0, valueSlot, valueSlot)
-
-        val out = insertAt(xml, base + count * 20, attr)
-        val p = findApplication(out)
-        putU16(out, p + 28, count + 1)
-        return out
-    }
-
-    private fun insertChildren(xml: ByteArray, elements: List<Element>, nsSlot: Int): ByteArray {
-        val pos = findApplication(xml)
-        require(pos >= 0) { "application element not found" }
-        val count = u16(xml, pos + 28)
-        val insertPos = pos + 36 + count * 20
-
-        val buf = ByteArrayOutputStream()
-        elements.forEach { el ->
-            buf.writeU16(CHUNK_START_ELEMENT)
-            buf.writeU16(16)
-            buf.writeI32(36 + el.attrs.size * 20)
-            buf.writeI32(1)
-            buf.writeI32(-1)
-            buf.writeI32(-1)
-            buf.writeI32(el.nameSlot)
-            buf.writeU16(20)
-            buf.writeU16(20)
-            buf.writeU16(el.attrs.size)
-            buf.writeU16(0)
-            buf.writeU16(0)
-            buf.writeU16(0)
-            el.attrs.forEach { at ->
-                when (val v = at.value) {
-                    is Value.Str -> buf.writeAttr(nsSlot, at.nameSlot, v.slot, TYPE_STRING, v.slot)
-                    is Value.Ref -> buf.writeAttr(-1, at.nameSlot, -1, TYPE_REFERENCE, v.v)
-                    is Value.Dec -> buf.writeAttr(-1, at.nameSlot, -1, TYPE_INT_DEC, v.v)
-                }
-            }
-            buf.writeU16(CHUNK_END_ELEMENT)
-            buf.writeU16(16)
-            buf.writeI32(24)
-            buf.writeI32(1)
-            buf.writeI32(-1)
-            buf.writeI32(-1)
-            buf.writeI32(el.nameSlot)
-        }
-
-        return insertAt(xml, insertPos, buf.toByteArray())
-    }
-
-    private fun insertBeforeApplication(
-        xml: ByteArray,
-        elemSlot: Int,
-        nameSlot: Int,
-        nsSlot: Int,
-        firstPermSlot: Int,
-        permCount: Int
-    ): ByteArray {
-        val pos = findApplication(xml)
-        if (pos < 0) return xml
-
-        val buf = ByteArrayOutputStream()
-        for (i in 0 until permCount) {
-            val valueSlot = firstPermSlot + i
-            buf.writeU16(CHUNK_START_ELEMENT)
-            buf.writeU16(16)
-            buf.writeI32(56)
-            buf.writeI32(1)
-            buf.writeI32(-1)
-            buf.writeI32(-1)
-            buf.writeI32(elemSlot)
-            buf.writeU16(20)
-            buf.writeU16(20)
-            buf.writeU16(1)
-            buf.writeU16(0)
-            buf.writeU16(0)
-            buf.writeU16(0)
-            buf.writeAttr(nsSlot, nameSlot, valueSlot, TYPE_STRING, valueSlot)
-            buf.writeU16(CHUNK_END_ELEMENT)
-            buf.writeU16(16)
-            buf.writeI32(24)
-            buf.writeI32(1)
-            buf.writeI32(-1)
-            buf.writeI32(-1)
-            buf.writeI32(elemSlot)
-        }
-        return insertAt(xml, pos, buf.toByteArray())
-    }
-
-    private fun insertAt(xml: ByteArray, pos: Int, block: ByteArray): ByteArray {
-        val out = ByteArrayOutputStream()
-        out.write(xml, 0, pos)
-        out.write(block)
-        out.write(xml, pos, xml.size - pos)
-        val result = out.toByteArray()
-        putI32(result, 4, result.size)
-        return result
     }
 
     private fun readVarint(b: ByteArray, off: Int): Pair<Int, Int>? {
