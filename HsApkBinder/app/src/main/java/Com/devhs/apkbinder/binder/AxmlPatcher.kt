@@ -26,7 +26,6 @@ object AxmlPatcher {
     }
 
     class Attr(val nameSlot: Int, val value: Value)
-    class Element(val nameSlot: Int, val attrs: List<Attr>)
 
     private class Pool(
         val start: Int,
@@ -40,7 +39,6 @@ object AxmlPatcher {
     )
 
     private class Node {
-        var type = 0
         var raw: ByteArray? = null
         var attrBytes: ByteArrayOutputStream? = null
         var attrCount = 0
@@ -125,10 +123,8 @@ object AxmlPatcher {
         return i32(xml, pos + 8 + stringIndex * 4)
     }
 
-    // ---------------- ট্রি পার্স ও এমিট ----------------
-
     private fun parse(xml: ByteArray): Node {
-        val root = Node().apply { type = -1 }
+        val root = Node()
         val stack = ArrayList<Node>()
         stack.add(root)
         var pos = 8
@@ -138,7 +134,6 @@ object AxmlPatcher {
             if (size < 8 || pos + size > xml.size) break
             if (type == CHUNK_START_ELEMENT) {
                 val node = Node()
-                node.type = type
                 node.nameIdx = i32(xml, pos + 20)
                 node.attrCount = u16(xml, pos + 28)
                 val buf = ByteArrayOutputStream()
@@ -150,7 +145,6 @@ object AxmlPatcher {
                 if (stack.size > 1) stack.removeAt(stack.size - 1)
             } else {
                 val node = Node()
-                node.type = type
                 node.raw = xml.copyOfRange(pos, pos + size)
                 stack[stack.size - 1].children.add(node)
             }
@@ -165,7 +159,7 @@ object AxmlPatcher {
             n.size = raw.size
             return
         }
-        var total = 36 + n.attrCount * 20
+        var total = 36 + n.attrCount * 20 + 24
         for (c in n.children) {
             measure(c)
             total += c.size
@@ -217,14 +211,13 @@ object AxmlPatcher {
         n.attrCount++
     }
 
-    private fun makeElement(slot: Int, attrs: List<Attr>): Node {
+    private fun makeElement(slot: Int, attrs: List<Attr>, nsSlot: Int): Node {
         val node = Node()
-        node.type = CHUNK_START_ELEMENT
         node.nameIdx = slot
         val buf = ByteArrayOutputStream()
         attrs.forEach { a ->
             when (val v = a.value) {
-                is Value.Str -> buf.writeAttr(-1, a.nameSlot, v.slot, TYPE_STRING, v.slot)
+                is Value.Str -> buf.writeAttr(nsSlot, a.nameSlot, v.slot, TYPE_STRING, v.slot)
                 is Value.Ref -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_REFERENCE, v.v)
                 is Value.Dec -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_DEC, v.v)
             }
@@ -233,8 +226,6 @@ object AxmlPatcher {
         node.attrCount = attrs.size
         return node
     }
-
-    // ---------------- যাচাই ----------------
 
     private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
         val pool = readPool(xml, 8)
@@ -343,8 +334,6 @@ object AxmlPatcher {
         null
     }
 
-    // ---------------- মূল প্যাচ ----------------
-
     fun patch(
         xml: ByteArray,
         newAppClass: String,
@@ -382,7 +371,6 @@ object AxmlPatcher {
         val application = findByName(root, withStrings, pool, "application")
             ?: throw IllegalStateException("application element not found")
 
-        // android:name রিপ্লেস বা যোগ
         var replaced = false
         val attrs = application.attrBytes!!.toByteArray()
         for (i in 0 until application.attrCount) {
@@ -404,28 +392,28 @@ object AxmlPatcher {
             appendAttr(application, one.toByteArray())
         }
 
-        // activity + service যোগ (application-এর শুরুতে)
         val gate = makeElement(
             slot(4),
             listOf(
                 Attr(slot(0), Value.Str(slot(8))),
                 Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
-            )
+            ),
+            slot(3)
         )
         val service = makeElement(
             slot(5),
             listOf(
                 Attr(slot(0), Value.Str(slot(9))),
                 Attr(slot(2), Value.Dec(1))
-            )
+            ),
+            slot(3)
         )
         application.children.add(0, service)
         application.children.add(0, gate)
 
-        // পারমিশন যোগ (manifest-এ, application-এর আগে)
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
-            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))), slot(3))
             manifest.children.add(index, perm)
         }
 
