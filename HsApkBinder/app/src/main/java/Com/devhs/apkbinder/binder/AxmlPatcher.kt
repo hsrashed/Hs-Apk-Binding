@@ -153,18 +153,15 @@ object AxmlPatcher {
         return root
     }
 
+    /** AXML-এ এলিমেন্টের size = ৩৬ + অ্যাট্রিবিউট×২০ (চাইল্ড ও END ধরে না) */
     private fun measure(n: Node) {
         val raw = n.raw
         if (raw != null) {
             n.size = raw.size
             return
         }
-        var total = 36 + n.attrCount * 20 + 24
-        for (c in n.children) {
-            measure(c)
-            total += c.size
-        }
-        n.size = total
+        for (c in n.children) measure(c)
+        n.size = 36 + n.attrCount * 20
     }
 
     private fun emit(n: Node, out: ByteArrayOutputStream) {
@@ -276,9 +273,6 @@ object AxmlPatcher {
             sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
-        val head = StringBuilder()
-        for (i in 0 until minOf(48, xml.size)) head.append(String.format("%02X", xml[i]))
-
         val seq = StringBuilder()
         var p2 = 8
         var k = 0
@@ -289,10 +283,9 @@ object AxmlPatcher {
             p2 += if (s >= 8 && p2 + s <= xml.size) s else 4
             k++
         }
-
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
             " utf8=" + utf8 + " size=" + xml.size + " ss=" + pool.stringsStart +
-            "\nSAMPLE=" + sample + "\nHEAD=" + head + "\nSEQ=" + seq
+            "\nSAMPLE=" + sample + "\nSEQ=" + seq
     }
 
     fun appAttrs(xml: ByteArray): String {
