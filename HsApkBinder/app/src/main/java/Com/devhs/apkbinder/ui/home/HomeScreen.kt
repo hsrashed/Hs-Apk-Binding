@@ -360,7 +360,3 @@ private fun AppPickerDialog(onDismiss: () -> Unit, onPick: (ApplicationInfo) -> 
         confirmButton = { TextButton(onClick = onDismiss) { Text("Close", color = TextMuted) } }
     )
 }
-
-
-
-
