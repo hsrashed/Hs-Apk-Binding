@@ -129,6 +129,7 @@ class BinderEngine(private val ctx: Context) {
             }
             emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
             emit(LogLevel.INFO, "App attrs: " + AxmlPatcher.appAttrs(patched))
+            emit(LogLevel.INFO, "Patched stats: " + AxmlPatcher.stats(patched))
 
             emit(LogLevel.INFO, "Collecting payload dex...")
             val dexes = collectOwnDex()
