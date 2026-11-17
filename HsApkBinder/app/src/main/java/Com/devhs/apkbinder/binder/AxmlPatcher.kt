@@ -276,8 +276,23 @@ object AxmlPatcher {
             sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
+        val head = StringBuilder()
+        for (i in 0 until minOf(48, xml.size)) head.append(String.format("%02X", xml[i]))
+
+        val seq = StringBuilder()
+        var p2 = 8
+        var k = 0
+        while (p2 + 8 <= xml.size && k < 12) {
+            val t = u16(xml, p2)
+            val s = i32(xml, p2 + 4)
+            seq.append(Integer.toHexString(t)).append(':').append(s).append(' ')
+            p2 += if (s >= 8 && p2 + s <= xml.size) s else 4
+            k++
+        }
+
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
-            " utf8=" + utf8 + " size=" + xml.size + "\nSAMPLE=" + sample
+            " utf8=" + utf8 + " size=" + xml.size + " ss=" + pool.stringsStart +
+            "\nSAMPLE=" + sample + "\nHEAD=" + head + "\nSEQ=" + seq
     }
 
     fun appAttrs(xml: ByteArray): String {
