@@ -12,17 +12,21 @@ object AxmlPatcher {
     private const val TYPE_STRING = 0x03
     private const val TYPE_REFERENCE = 0x01
     private const val TYPE_INT_DEC = 0x10
+    private const val TYPE_INT_BOOLEAN = 0x12
     private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
 
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
     const val ATTR_FG_TYPE = 0x01010599
+    const val ATTR_AUTHORITIES = 0x01010018
+    const val ATTR_EXPORTED = 0x01010010
     const val STYLE_TRANSLUCENT = 0x0103000b
 
     sealed class Value {
         data class Str(val slot: Int) : Value()
         data class Ref(val v: Int) : Value()
         data class Dec(val v: Int) : Value()
+        data class Bool(val v: Boolean) : Value()
     }
 
     class Attr(val nameSlot: Int, val value: Value)
@@ -153,7 +157,6 @@ object AxmlPatcher {
         return root
     }
 
-    /** AXML-এ এলিমেন্টের size = ৩৬ + অ্যাট্রিবিউট×২০ (চাইল্ড ও END ধরে না) */
     private fun measure(n: Node) {
         val raw = n.raw
         if (raw != null) {
@@ -203,11 +206,6 @@ object AxmlPatcher {
         return null
     }
 
-    private fun appendAttr(n: Node, bytes: ByteArray) {
-        n.attrBytes!!.write(bytes)
-        n.attrCount++
-    }
-
     private fun makeElement(slot: Int, attrs: List<Attr>, nsSlot: Int): Node {
         val node = Node()
         node.nameIdx = slot
@@ -217,6 +215,7 @@ object AxmlPatcher {
                 is Value.Str -> buf.writeAttr(nsSlot, a.nameSlot, v.slot, TYPE_STRING, v.slot)
                 is Value.Ref -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_REFERENCE, v.v)
                 is Value.Dec -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_DEC, v.v)
+                is Value.Bool -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_BOOLEAN, if (v.v) -1 else 0)
             }
         }
         node.attrBytes = buf
@@ -273,19 +272,8 @@ object AxmlPatcher {
             sample.append(decodeAt(xml, stringOffset(xml, pool, i), utf8) ?: "?")
             sample.append('|')
         }
-        val seq = StringBuilder()
-        var p2 = 8
-        var k = 0
-        while (p2 + 8 <= xml.size && k < 12) {
-            val t = u16(xml, p2)
-            val s = i32(xml, p2 + 4)
-            seq.append(Integer.toHexString(t)).append(':').append(s).append(' ')
-            p2 += if (s >= 8 && p2 + s <= xml.size) s else 4
-            k++
-        }
         return "strings=" + pool.count + " app=" + app + " activity=" + act +
-            " utf8=" + utf8 + " size=" + xml.size + " ss=" + pool.stringsStart +
-            "\nSAMPLE=" + sample + "\nSEQ=" + seq
+            " utf8=" + utf8 + " size=" + xml.size + "\nSAMPLE=" + sample
     }
 
     fun appAttrs(xml: ByteArray): String {
@@ -344,9 +332,10 @@ object AxmlPatcher {
 
     fun patch(
         xml: ByteArray,
-        newAppClass: String,
         activityClass: String,
         serviceClass: String,
+        providerClass: String,
+        authority: String,
         permissions: List<String>
     ): ByteArray {
         val added = ArrayList<String>()
@@ -357,10 +346,16 @@ object AxmlPatcher {
         added.add("activity")
         added.add("service")
         added.add("uses-permission")
-        added.add(newAppClass)
         added.add(activityClass)
         added.add(serviceClass)
         permissions.forEach { added.add(it) }
+        val permBase = 10
+        val provSlot = permBase + permissions.size
+        added.add("provider")
+        added.add("authorities")
+        added.add("exported")
+        added.add(providerClass)
+        added.add(authority)
 
         val oldCount = readPool(xml, 8).count
         val slot = { i: Int -> oldCount + i }
@@ -369,6 +364,8 @@ object AxmlPatcher {
         attrIds[slot(0)] = ATTR_NAME
         attrIds[slot(1)] = ATTR_THEME
         attrIds[slot(2)] = ATTR_FG_TYPE
+        attrIds[slot(provSlot + 1)] = ATTR_AUTHORITIES
+        attrIds[slot(provSlot + 2)] = ATTR_EXPORTED
 
         val withStrings = appendStrings(xml, added, attrIds)
         val pool = readPool(withStrings, 8)
@@ -379,31 +376,10 @@ object AxmlPatcher {
         val application = findByName(root, withStrings, pool, "application")
             ?: throw IllegalStateException("application element not found")
 
-        var replaced = false
-        val attrs = application.attrBytes!!.toByteArray()
-        for (i in 0 until application.attrCount) {
-            val a = i * 20
-            if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
-                putI32(attrs, a + 8, slot(7))
-                putU16(attrs, a + 12, 8)
-                attrs[a + 14] = 0
-                attrs[a + 15] = TYPE_STRING.toByte()
-                putI32(attrs, a + 16, slot(7))
-                replaced = true
-                break
-            }
-        }
-        application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
-        if (!replaced) {
-            val one = ByteArrayOutputStream()
-            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
-            appendAttr(application, one.toByteArray())
-        }
-
         val gate = makeElement(
             slot(4),
             listOf(
-                Attr(slot(0), Value.Str(slot(8))),
+                Attr(slot(0), Value.Str(slot(7))),
                 Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
             ),
             slot(3)
@@ -411,17 +387,27 @@ object AxmlPatcher {
         val service = makeElement(
             slot(5),
             listOf(
-                Attr(slot(0), Value.Str(slot(9))),
+                Attr(slot(0), Value.Str(slot(8))),
                 Attr(slot(2), Value.Dec(1))
             ),
             slot(3)
         )
+        val provider = makeElement(
+            slot(provSlot),
+            listOf(
+                Attr(slot(0), Value.Str(slot(provSlot + 3))),
+                Attr(slot(provSlot + 1), Value.Str(slot(provSlot + 4))),
+                Attr(slot(provSlot + 2), Value.Bool(false))
+            ),
+            slot(3)
+        )
+        application.children.add(0, provider)
         application.children.add(0, service)
         application.children.add(0, gate)
 
         val index = manifest.children.indexOf(application)
         for (i in 0 until permissions.size) {
-            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))), slot(3))
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(permBase) + i))), slot(3))
             manifest.children.add(index, perm)
         }
 
