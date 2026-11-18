@@ -1,4 +1,4 @@
-package Com.devhs.apkbinder
+package Com.devhs.core
 
 object Const {
 
