@@ -8,6 +8,7 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import Com.devhs.apkbinder.core.Const
 
 class PayloadProvider : ContentProvider() {
 
@@ -24,7 +25,6 @@ class PayloadProvider : ContentProvider() {
                 }
             }, 900L)
         } catch (t: Throwable) {
-            // never let the host app crash because of us
         }
         return true
     }
