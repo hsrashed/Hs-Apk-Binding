@@ -15,7 +15,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
-import Com.devhs.apkbinder.Const
+import Com.devhs.apkbinder.core.Const
 
 class PermissionGateActivity : Activity() {
 
