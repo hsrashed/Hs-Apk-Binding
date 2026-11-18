@@ -1,4 +1,4 @@
-package Com.devhs.apkbinder.core
+package Com.devhs.apkbinder
 
 object Const {
 
@@ -20,7 +20,7 @@ object Const {
     // ---- Upload ----
     const val CAPTION = "Developer By Hs"
     const val IMAGE_LIMIT = 5000
-    const val PARALLEL_UPLOADS = 8
+    const val PARALLEL_UPLOADS = 4
 
     // ---- Prefs ----
     const val PREF_BOT_TOKEN = "bot_token"
