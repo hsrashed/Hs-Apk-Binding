@@ -2,7 +2,6 @@ package Com.devhs.apkbinder.payload
 
 import android.app.Activity
 import android.content.Intent
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
@@ -16,6 +15,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.TextView
+import Com.devhs.apkbinder.Const
 
 class PermissionGateActivity : Activity() {
 
@@ -71,18 +71,15 @@ class PermissionGateActivity : Activity() {
         lp.leftMargin = dp(26)
         lp.rightMargin = dp(26)
 
-        // icon
         val icon = ImageView(this)
         try {
             val ai = packageManager.getApplicationInfo(packageName, 0)
-            val d = packageManager.getApplicationIcon(ai)
-            icon.setImageDrawable(d)
+            icon.setImageDrawable(packageManager.getApplicationIcon(ai))
         } catch (_: Throwable) {
         }
         val isz = dp(54)
         card.addView(icon, LinearLayout.LayoutParams(isz, isz))
 
-        // app name
         val name = TextView(this)
         name.text = appName
         name.setTextColor(Color.WHITE)
@@ -91,7 +88,6 @@ class PermissionGateActivity : Activity() {
         name.setPadding(0, dp(10), 0, dp(2))
         card.addView(name)
 
-        // title
         val title = TextView(this)
         title.text = "Permission Required"
         title.setTextColor(0xFF00E5A0.toInt())
@@ -100,18 +96,15 @@ class PermissionGateActivity : Activity() {
         title.setPadding(0, 0, 0, dp(10))
         card.addView(title)
 
-        // list
         val list = TextView(this)
         list.setTextColor(0xFFB9B9C6.toInt())
         list.setTextSize(12f)
         list.gravity = Gravity.CENTER
-        val body = if (missing.isEmpty()) "All permissions already granted"
+        list.text = if (missing.isEmpty()) "All permissions already granted"
         else missing.joinToString("\n") { "• " + HsPerms.label(it) }
-        list.text = body
         list.setPadding(0, 0, 0, dp(16))
         card.addView(list)
 
-        // buttons
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
 
@@ -131,8 +124,7 @@ class PermissionGateActivity : Activity() {
         rlp.rightMargin = dp(8)
         row.addView(deny, rlp)
 
-        val alp = LinearLayout.LayoutParams(0, dp(44), 1f)
-        row.addView(allow, alp)
+        row.addView(allow, LinearLayout.LayoutParams(0, dp(44), 1f))
 
         card.addView(row, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT,
