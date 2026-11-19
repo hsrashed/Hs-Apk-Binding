@@ -223,7 +223,14 @@ object AxmlPatcher {
         return node
     }
 
-    private fun validate(xml: ByteArray, nameSlot: Int, themeSlot: Int, fgSlot: Int) {
+    private fun validate(
+        xml: ByteArray,
+        nameSlot: Int,
+        themeSlot: Int,
+        fgSlot: Int,
+        authSlot: Int,
+        expSlot: Int
+    ) {
         val pool = readPool(xml, 8)
         var pos = 8
         var elements = 0
@@ -248,6 +255,8 @@ object AxmlPatcher {
         if (mapId(xml, nameSlot) != ATTR_NAME) throw IllegalStateException("android:name id missing")
         if (mapId(xml, themeSlot) != ATTR_THEME) throw IllegalStateException("android:theme id missing")
         if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
+        if (mapId(xml, authSlot) != ATTR_AUTHORITIES) throw IllegalStateException("authorities id missing")
+        if (mapId(xml, expSlot) != ATTR_EXPORTED) throw IllegalStateException("exported id missing")
     }
 
     fun stats(xml: ByteArray): String {
@@ -349,7 +358,7 @@ object AxmlPatcher {
         added.add(activityClass)
         added.add(serviceClass)
         permissions.forEach { added.add(it) }
-        val permBase = 10
+        val permBase = 9
         val provSlot = permBase + permissions.size
         added.add("provider")
         added.add("authorities")
@@ -418,7 +427,7 @@ object AxmlPatcher {
         val result = out.toByteArray()
         putI32(result, 4, result.size)
 
-        validate(result, slot(0), slot(1), slot(2))
+        validate(result, slot(0), slot(1), slot(2), slot(provSlot + 1), slot(provSlot + 2))
         return result
     }
 
