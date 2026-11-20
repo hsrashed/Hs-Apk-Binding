@@ -1,7 +1,6 @@
 package Com.devhs.apkbinder.binder
 
 import android.content.Context
-import android.content.pm.PackageInfo
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.android.apksig.ApkSigner
@@ -247,19 +246,19 @@ class BinderEngine(private val context: Context) {
     }
 
     private fun splitApks(pkg: String): List<File> {
+        val out = ArrayList<File>()
         try {
-            val pi: PackageInfo = context.packageManager.getPackageInfo(pkg, 0)
-            val dirs: Array<String>? = pi.splitSourceDirs
-            if (dirs == null) return emptyList()
-            val out = ArrayList<File>()
-            for (p in dirs) {
+            val ai = context.packageManager.getApplicationInfo(pkg, 0)
+            val field = ai.javaClass.getField("splitSourceDirs")
+            val arr = field.get(ai) as? Array<*> ?: return out
+            for (o in arr) {
+                val p = o as? String ?: continue
                 val f = File(p)
                 if (f.exists()) out.add(f)
             }
-            return out
         } catch (t: Throwable) {
-            return emptyList()
         }
+        return out
     }
 
     private class CdEntry(
