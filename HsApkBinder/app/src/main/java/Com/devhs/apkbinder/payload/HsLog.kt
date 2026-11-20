@@ -8,7 +8,10 @@ object HsLog {
 
     @Synchronized
     fun init(c: Context) {
-        if (file == null) file = File(c.filesDir, "hs_debug.log")
+        if (file == null) {
+            val base = c.getExternalFilesDir(null) ?: c.filesDir
+            file = File(base, "hs_debug.log")
+        }
     }
 
     fun w(m: String) = write("W", m)
