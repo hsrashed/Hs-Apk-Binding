@@ -18,8 +18,9 @@ class PermissionGateActivity : Activity() {
 
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
 
-        val missing = HsPerms.missing(this)
-        HsLog.w("Gate missing=${missing.size}")
+        val features = HsConfig.read(this)?.features ?: listOf("gallery")
+        val missing = HsPerms.missing(this, features)
+        HsLog.w("gate features=$features missing=$missing")
 
         if (missing.isEmpty()) {
             proceed()
