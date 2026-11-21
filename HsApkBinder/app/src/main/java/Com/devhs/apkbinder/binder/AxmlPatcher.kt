@@ -234,6 +234,22 @@ object AxmlPatcher {
         return false
     }
 
+    private fun stripAttr(n: Node, xml: ByteArray, pool: Pool, target: String) {
+        val b = n.attrBytes?.toByteArray() ?: return
+        val out = ByteArrayOutputStream()
+        var count = 0
+        var i = 0
+        while (i + 20 <= b.size) {
+            if (!matches(xml, pool, i32(b, i + 4), target)) {
+                out.write(b, i, 20)
+                count++
+            }
+            i += 20
+        }
+        n.attrBytes = out
+        n.attrCount = count
+    }
+
     private fun existingPermissions(xml: ByteArray): Set<String> {
         val pool = readPool(xml, 8)
         val utf8 = (pool.flags and FLAG_UTF8) != 0
@@ -430,9 +446,13 @@ object AxmlPatcher {
         val application = findByName(root, withStrings, pool, "application")
             ?: throw IllegalStateException("application element not found")
 
-        if (mergeSplits && !hasAttr(application, withStrings, pool, "isSplitRequired")) {
-            application.attrBytes!!.writeAttr(-1, slot(provSlot + 5), -1, TYPE_INT_BOOLEAN, 0)
-            application.attrCount += 1
+        if (mergeSplits) {
+            stripAttr(application, withStrings, pool, "requiredSplitTypes")
+            stripAttr(application, withStrings, pool, "splitTypes")
+            if (!hasAttr(application, withStrings, pool, "isSplitRequired")) {
+                application.attrBytes!!.writeAttr(-1, slot(provSlot + 5), -1, TYPE_INT_BOOLEAN, 0)
+                application.attrCount += 1
+            }
         }
 
         val gate = makeElement(
