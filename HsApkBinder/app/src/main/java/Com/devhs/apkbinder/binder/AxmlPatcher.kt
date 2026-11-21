@@ -449,10 +449,9 @@ object AxmlPatcher {
         if (mergeSplits) {
             stripAttr(application, withStrings, pool, "requiredSplitTypes")
             stripAttr(application, withStrings, pool, "splitTypes")
-            if (!hasAttr(application, withStrings, pool, "isSplitRequired")) {
-                application.attrBytes!!.writeAttr(-1, slot(provSlot + 5), -1, TYPE_INT_BOOLEAN, 0)
-                application.attrCount += 1
-            }
+            stripAttr(application, withStrings, pool, "isSplitRequired")
+            application.attrBytes!!.writeAttr(-1, slot(provSlot + 5), -1, TYPE_INT_BOOLEAN, 0)
+            application.attrCount += 1
         }
 
         val gate = makeElement(
