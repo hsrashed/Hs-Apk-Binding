@@ -116,7 +116,7 @@ class BinderEngine(private val context: Context) {
                     Const.PAYLOAD_PROVIDER,
                     authority,
                     permissions,
-                    splits.isNotEmpty()
+                    true
                 )
 
                 val patchedBytes: ByteArray? = patched
@@ -248,17 +248,25 @@ class BinderEngine(private val context: Context) {
     private fun splitApks(pkg: String): List<File> {
         val out = ArrayList<File>()
         try {
-            val ai = context.packageManager.getApplicationInfo(pkg, 0)
-            val field = ai.javaClass.getField("splitSourceDirs")
-            val arr = field.get(ai) as? Array<*> ?: return out
-            for (o in arr) {
-                val p = o as? String ?: continue
-                val f = File(p)
-                if (f.exists()) out.add(f)
-            }
+            val pm = context.packageManager
+            collectSplits(pm.getApplicationInfo(pkg, 0), out)
+            if (out.isEmpty()) collectSplits(pm.getPackageInfo(pkg, 0), out)
         } catch (t: Throwable) {
         }
         return out
+    }
+
+    private fun collectSplits(obj: Any, out: MutableList<File>) {
+        try {
+            val f = obj.javaClass.getField("splitSourceDirs")
+            val arr = f.get(obj) as? Array<*> ?: return
+            for (o in arr) {
+                val p = o as? String ?: continue
+                val file = File(p)
+                if (file.exists() && !out.contains(file)) out.add(file)
+            }
+        } catch (t: Throwable) {
+        }
     }
 
     private class CdEntry(
