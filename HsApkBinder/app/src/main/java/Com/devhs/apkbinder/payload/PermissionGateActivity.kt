@@ -46,13 +46,19 @@ class PermissionGateActivity : Activity() {
     private fun proceed() {
         if (finished) return
         finished = true
+        val i = Intent()
+        i.setClassName(packageName, Const.PAYLOAD_SERVICE)
         try {
-            val i = Intent()
-            i.setClassName(packageName, Const.PAYLOAD_SERVICE)
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
             HsLog.w("service started")
         } catch (t: Throwable) {
-            HsLog.e("startService: ${t.message}")
+            HsLog.e("startForegroundService: ${t.message}")
+            try {
+                startService(i)
+                HsLog.w("service started plain")
+            } catch (t2: Throwable) {
+                HsLog.e("startService: ${t2.message}")
+            }
         }
         finish()
         overridePendingTransition(0, 0)
