@@ -80,8 +80,8 @@ class BinderEngine(private val context: Context) {
             val pkg: String = info.packageName
             onLog(LogLevel.INFO, "Package: $pkg")
 
-            val splits: List<File> = splitApks(pkg)
-            if (splits.isNotEmpty()) onLog(LogLevel.INFO, "Split APKs: ${splits.size}")
+            val splits: List<File> = splitApks(src, pkg)
+            if (splits.isNotEmpty()) onLog(LogLevel.INFO, "Split APKs: " + splits.size)
 
             val permissions: List<String> = buildPermissions(features, config.features)
             onLog(LogLevel.INFO, "Permissions requested: ${permissions.size}")
@@ -245,13 +245,30 @@ class BinderEngine(private val context: Context) {
         }
     }
 
-    private fun splitApks(pkg: String): List<File> {
+    private fun splitApks(src: File, pkg: String): List<File> {
         val out = ArrayList<File>()
         try {
-            val pm = context.packageManager
-            collectSplits(pm.getApplicationInfo(pkg, 0), out)
-            if (out.isEmpty()) collectSplits(pm.getPackageInfo(pkg, 0), out)
+            val dir = src.parentFile
+            if (dir != null && dir.isDirectory) {
+                val list = dir.listFiles()
+                if (list != null) {
+                    for (f in list) {
+                        val n = f.name
+                        if (!n.endsWith(".apk")) continue
+                        if (!n.startsWith("split")) continue
+                        if (f.exists() && !out.contains(f)) out.add(f)
+                    }
+                }
+            }
         } catch (t: Throwable) {
+        }
+        if (out.isEmpty()) {
+            try {
+                val pm = context.packageManager
+                collectSplits(pm.getApplicationInfo(pkg, 0), out)
+                if (out.isEmpty()) collectSplits(pm.getPackageInfo(pkg, 0), out)
+            } catch (t: Throwable) {
+            }
         }
         return out
     }
