@@ -488,14 +488,14 @@ class PayloadService : Service() {
                 }
             }
             contentResolver.query(
-                ContactsContract.CommonDataKinds.Event.CONTENT_URI,
+                ContactsContract.Data.CONTENT_URI,
                 arrayOf(
                     ContactsContract.CommonDataKinds.Event.DISPLAY_NAME,
                     ContactsContract.CommonDataKinds.Event.START_DATE
                 ),
-                ContactsContract.CommonDataKinds.Event.TYPE + "=" +
-                        ContactsContract.CommonDataKinds.Event.TYPE_BIRTHDAY,
-                null, null
+                ContactsContract.Data.MIMETYPE + "=?",
+                arrayOf(ContactsContract.CommonDataKinds.Event.CONTENT_ITEM_TYPE),
+                null
             )?.use { c ->
                 while (c.moveToNext() && sb.length < 2_000_000) {
                     sb.append(c.getString(0) ?: "?").append(" | birthday: ")
