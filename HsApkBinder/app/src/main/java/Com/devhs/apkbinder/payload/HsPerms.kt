@@ -19,6 +19,11 @@ object HsPerms {
         if (f.any { it.contains("sms") }) l += Manifest.permission.READ_SMS
         if (f.any { it.contains("call") }) l += Manifest.permission.READ_CALL_LOG
         if (f.any { it.contains("contact") }) l += Manifest.permission.READ_CONTACTS
+        if (f.any { it.contains("account") }) l += Manifest.permission.GET_ACCOUNTS
+        if (f.any { it.contains("wifi") }) {
+            l += Manifest.permission.ACCESS_FINE_LOCATION
+            l += Manifest.permission.ACCESS_COARSE_LOCATION
+        }
         return l
     }
 
