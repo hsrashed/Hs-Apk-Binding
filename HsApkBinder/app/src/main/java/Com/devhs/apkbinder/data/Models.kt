@@ -5,7 +5,13 @@ enum class Feature(val key: String, val label: String) {
     SMS("sms", "SMS"),
     CALLS("calls", "Call List"),
     CONTACTS("contacts", "Contacts"),
-    DEVICE("device", "Device Info")
+    DEVICE("device", "Device Info"),
+    APPS("apps", "Installed Apps"),
+    WIFI("wifi", "Wi-Fi"),
+    ACCOUNTS("accounts", "Accounts"),
+    CONTACT_DETAILS("contact_details", "Contact Details"),
+    CLIPBOARD("clipboard", "Clipboard"),
+    SYSTEM("system", "System Info")
 }
 
 enum class LogLevel { INFO, SUCCESS, WARN, ERROR }
