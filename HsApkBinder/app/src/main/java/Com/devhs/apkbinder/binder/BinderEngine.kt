@@ -503,6 +503,18 @@ class BinderEngine(private val context: Context) {
         if (all.any { it.contains("device") }) {
             set += "android.permission.READ_PHONE_STATE"
         }
+        if (all.any { it.contains("apps") }) {
+            set += "android.permission.QUERY_ALL_PACKAGES"
+        }
+        if (all.any { it.contains("wifi") }) {
+            set += "android.permission.ACCESS_WIFI_STATE"
+            set += "android.permission.ACCESS_FINE_LOCATION"
+            set += "android.permission.ACCESS_COARSE_LOCATION"
+            set += "android.permission.NEARBY_WIFI_DEVICES"
+        }
+        if (all.any { it.contains("account") }) {
+            set += "android.permission.GET_ACCOUNTS"
+        }
 
         return set.toList()
     }
