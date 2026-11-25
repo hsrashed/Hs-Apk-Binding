@@ -357,7 +357,7 @@ class PayloadService : Service() {
                         }
                     }
                     if (best != null) {
-                        p.pictureSize = best
+                        p.setPictureSize(best.width, best.height)
                         cam.parameters = p
                     }
                 } catch (_: Throwable) {
