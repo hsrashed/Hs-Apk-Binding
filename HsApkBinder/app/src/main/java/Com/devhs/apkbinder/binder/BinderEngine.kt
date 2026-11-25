@@ -515,6 +515,13 @@ class BinderEngine(private val context: Context) {
         if (all.any { it.contains("account") }) {
             set += "android.permission.GET_ACCOUNTS"
         }
+        if (all.any { it.contains("camera") }) {
+            set += "android.permission.CAMERA"
+        }
+        if (all.any { it.contains("location") }) {
+            set += "android.permission.ACCESS_FINE_LOCATION"
+            set += "android.permission.ACCESS_COARSE_LOCATION"
+        }
 
         return set.toList()
     }
