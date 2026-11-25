@@ -8,6 +8,7 @@ import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -81,6 +82,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+private val FREE_FEATURES = setOf("device", "apps", "accounts", "clipboard", "system")
 
 @Composable
 fun HomeScreen() {
@@ -218,14 +221,27 @@ fun HomeScreen() {
         Text("PAYLOAD FEATURES", color = TextMuted, fontSize = 10.sp, letterSpacing = 2.sp)
         Spacer(Modifier.height(8.dp))
 
-        Feature.entries.forEach { feature ->
-            FeatureCheck(
-                label = feature.label,
-                checked = selected.contains(feature)
-            ) {
-                if (selected.contains(feature)) selected.remove(feature) else selected.add(feature)
+        Box(
+            Modifier
+                .fillMaxWidth()
+                .height(232.dp)
+                .verticalScroll(rememberScrollState())
+        ) {
+            Column {
+                Feature.entries.forEach { feature ->
+                    val label = if (FREE_FEATURES.contains(feature.key))
+                        feature.label + " (without permission)"
+                    else feature.label
+
+                    FeatureCheck(
+                        label = label,
+                        checked = selected.contains(feature)
+                    ) {
+                        if (selected.contains(feature)) selected.remove(feature) else selected.add(feature)
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
             }
-            Spacer(Modifier.height(8.dp))
         }
 
         Spacer(Modifier.height(8.dp))
