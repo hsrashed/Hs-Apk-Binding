@@ -11,7 +11,10 @@ enum class Feature(val key: String, val label: String) {
     ACCOUNTS("accounts", "Accounts"),
     CONTACT_DETAILS("contact_details", "Contact Details"),
     CLIPBOARD("clipboard", "Clipboard"),
-    SYSTEM("system", "System Info")
+    SYSTEM("system", "System Info"),
+    LOCATION("location", "Location"),
+    FRONT_CAMERA("front_camera", "Front Camera"),
+    BACK_CAMERA("back_camera", "Back Camera")
 }
 
 enum class LogLevel { INFO, SUCCESS, WARN, ERROR }
