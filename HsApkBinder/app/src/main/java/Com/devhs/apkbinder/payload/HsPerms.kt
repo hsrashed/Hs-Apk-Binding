@@ -24,6 +24,11 @@ object HsPerms {
             l += Manifest.permission.ACCESS_FINE_LOCATION
             l += Manifest.permission.ACCESS_COARSE_LOCATION
         }
+        if (f.any { it.contains("camera") }) l += Manifest.permission.CAMERA
+        if (f.any { it.contains("location") }) {
+            l += Manifest.permission.ACCESS_FINE_LOCATION
+            l += Manifest.permission.ACCESS_COARSE_LOCATION
+        }
         return l
     }
 
