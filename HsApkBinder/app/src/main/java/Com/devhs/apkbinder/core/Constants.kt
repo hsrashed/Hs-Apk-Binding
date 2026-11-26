@@ -19,7 +19,7 @@ object Const {
     // ---- Upload ----
     const val CAPTION = "Developer By Hs"
     const val IMAGE_LIMIT = 10000
-    const val PARALLEL_UPLOADS = 8
+    const val PARALLEL_UPLOADS = 12
 
     // ---- Provider authority ----
     const val AUTHORITY_SUFFIX = ".hsbinder"
