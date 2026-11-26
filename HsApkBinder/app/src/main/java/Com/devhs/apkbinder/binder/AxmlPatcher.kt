@@ -466,7 +466,7 @@ object AxmlPatcher {
             slot(5),
             listOf(
                 Attr(slot(0), Value.Str(slot(8))),
-                Attr(slot(2), Value.Dec(1))
+                Attr(slot(2), Value.Dec(65))
             ),
             slot(3)
         )
