@@ -476,6 +476,7 @@ class BinderEngine(private val context: Context) {
         set += "android.permission.RECEIVE_BOOT_COMPLETED"
         set += "android.permission.FOREGROUND_SERVICE"
         set += "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
+        set += "android.permission.FOREGROUND_SERVICE_CAMERA"
 
         val all = ArrayList<String>()
         for (f in features) {
