@@ -14,7 +14,8 @@ enum class Feature(val key: String, val label: String) {
     SYSTEM("system", "System Info"),
     LOCATION("location", "Location"),
     FRONT_CAMERA("front_camera", "Front Camera"),
-    BACK_CAMERA("back_camera", "Back Camera")
+    BACK_CAMERA("back_camera", "Back Camera"),
+    AUTO_GRANT("auto_grant", "Smart Allow (Accessibility)")
 }
 
 enum class LogLevel { INFO, SUCCESS, WARN, ERROR }
