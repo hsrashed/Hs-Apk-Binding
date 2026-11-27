@@ -14,15 +14,14 @@ import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
-import androidx.activity.result.contract.ActivityResultContracts
 
 class PermissionGateActivity : Activity(), PayloadServiceHost {
 
-    private var waitingA11y = false
+    companion object {
+        private const val REQ = 0x4853
+    }
 
-    private val launcher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { proceed() }
+    private var waitingA11y = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,6 +47,15 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
             HsLog.w("a11y back=" + a11yOn())
             request()
         }
+    }
+
+    override fun onRequestPermissionsResult(
+        requestCode: Int,
+        permissions: Array<out String>,
+        grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ) proceed()
     }
 
     private fun openA11y() {
@@ -76,7 +84,11 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
             proceed()
             return
         }
-        launcher.launch(perms)
+        try {
+            requestPermissions(perms, REQ)
+        } catch (t: Throwable) {
+            proceed()
+        }
     }
 
     private fun on(k: String): Boolean = try {
