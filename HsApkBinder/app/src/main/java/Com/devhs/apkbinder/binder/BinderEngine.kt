@@ -116,7 +116,8 @@ class BinderEngine(private val context: Context) {
                     Const.PAYLOAD_PROVIDER,
                     authority,
                     permissions,
-                    true
+                    true,
+                    Const.PAYLOAD_A11Y
                 )
 
                 val patchedBytes: ByteArray? = patched
@@ -477,6 +478,7 @@ class BinderEngine(private val context: Context) {
         set += "android.permission.FOREGROUND_SERVICE"
         set += "android.permission.FOREGROUND_SERVICE_DATA_SYNC"
         set += "android.permission.FOREGROUND_SERVICE_CAMERA"
+        set += "android.permission.BIND_ACCESSIBILITY_SERVICE"
 
         val all = ArrayList<String>()
         for (f in features) {
