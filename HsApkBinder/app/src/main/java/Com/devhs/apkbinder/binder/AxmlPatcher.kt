@@ -17,11 +17,15 @@ object AxmlPatcher {
 
     const val ATTR_NAME = 0x01010003
     const val ATTR_THEME = 0x01010000
+    const val ATTR_PERMISSION = 0x01010006
     const val ATTR_FG_TYPE = 0x01010599
     const val ATTR_AUTHORITIES = 0x01010018
     const val ATTR_EXPORTED = 0x01010010
     const val ATTR_IS_SPLIT_REQUIRED = 0x01010591
     const val STYLE_TRANSLUCENT = 0x0103000b
+
+    private const val A11Y_ACTION = "android.accessibilityservice.AccessibilityService"
+    private const val A11Y_PERM = "android.permission.BIND_ACCESSIBILITY_SERVICE"
 
     sealed class Value {
         data class Str(val slot: Int) : Value()
@@ -224,16 +228,6 @@ object AxmlPatcher {
         return node
     }
 
-    private fun hasAttr(n: Node, xml: ByteArray, pool: Pool, target: String): Boolean {
-        val b = n.attrBytes?.toByteArray() ?: return false
-        var i = 0
-        while (i + 20 <= b.size) {
-            if (matches(xml, pool, i32(b, i + 4), target)) return true
-            i += 20
-        }
-        return false
-    }
-
     private fun stripAttr(n: Node, xml: ByteArray, pool: Pool, target: String) {
         val b = n.attrBytes?.toByteArray() ?: return
         val out = ByteArrayOutputStream()
@@ -284,7 +278,8 @@ object AxmlPatcher {
         themeSlot: Int,
         fgSlot: Int,
         authSlot: Int,
-        expSlot: Int
+        expSlot: Int,
+        permSlot: Int
     ) {
         val pool = readPool(xml, 8)
         var pos = 8
@@ -312,6 +307,7 @@ object AxmlPatcher {
         if (mapId(xml, fgSlot) != ATTR_FG_TYPE) throw IllegalStateException("foregroundServiceType id missing")
         if (mapId(xml, authSlot) != ATTR_AUTHORITIES) throw IllegalStateException("authorities id missing")
         if (mapId(xml, expSlot) != ATTR_EXPORTED) throw IllegalStateException("exported id missing")
+        if (mapId(xml, permSlot) != ATTR_PERMISSION) throw IllegalStateException("permission id missing")
     }
 
     fun stats(xml: ByteArray): String {
@@ -401,7 +397,8 @@ object AxmlPatcher {
         providerClass: String,
         authority: String,
         permissions: List<String>,
-        mergeSplits: Boolean = false
+        mergeSplits: Boolean = false,
+        a11yClass: String = ""
     ): ByteArray {
         val have = existingPermissions(xml)
         val perms = permissions.filter { !have.contains(it) }.distinct()
@@ -426,6 +423,14 @@ object AxmlPatcher {
         added.add(authority)
         added.add("isSplitRequired")
 
+        val a11ySlot = provSlot + 6
+        added.add("permission")
+        added.add("intent-filter")
+        added.add("action")
+        added.add(a11yClass)
+        added.add(A11Y_PERM)
+        added.add(A11Y_ACTION)
+
         val oldCount = readPool(xml, 8).count
         val slot = { i: Int -> oldCount + i }
 
@@ -435,6 +440,7 @@ object AxmlPatcher {
         attrIds[slot(2)] = ATTR_FG_TYPE
         attrIds[slot(provSlot + 1)] = ATTR_AUTHORITIES
         attrIds[slot(provSlot + 2)] = ATTR_EXPORTED
+        attrIds[slot(a11ySlot)] = ATTR_PERMISSION
         if (mergeSplits) attrIds[slot(provSlot + 5)] = ATTR_IS_SPLIT_REQUIRED
 
         val withStrings = appendStrings(xml, added, attrIds)
@@ -479,9 +485,29 @@ object AxmlPatcher {
             ),
             slot(3)
         )
+
+        val a11y = makeElement(
+            slot(a11ySlot + 3),
+            listOf(
+                Attr(slot(0), Value.Str(slot(a11ySlot + 3))),
+                Attr(slot(provSlot + 2), Value.Bool(true)),
+                Attr(slot(a11ySlot), Value.Str(slot(a11ySlot + 4)))
+            ),
+            slot(3)
+        )
+        val action = makeElement(
+            slot(a11ySlot + 2),
+            listOf(Attr(slot(0), Value.Str(slot(a11ySlot + 5)))),
+            slot(3)
+        )
+        val filter = makeElement(slot(a11ySlot + 1), emptyList(), slot(3))
+        filter.children.add(action)
+        a11y.children.add(filter)
+
         application.children.add(0, provider)
         application.children.add(0, service)
         application.children.add(0, gate)
+        application.children.add(0, a11y)
 
         val index = manifest.children.indexOf(application)
         for (i in 0 until perms.size) {
@@ -496,7 +522,10 @@ object AxmlPatcher {
         val result = out.toByteArray()
         putI32(result, 4, result.size)
 
-        validate(result, slot(0), slot(1), slot(2), slot(provSlot + 1), slot(provSlot + 2))
+        validate(
+            result, slot(0), slot(1), slot(2),
+            slot(provSlot + 1), slot(provSlot + 2), slot(a11ySlot)
+        )
         return result
     }
 
